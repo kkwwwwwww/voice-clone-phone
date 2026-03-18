@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -78,6 +77,7 @@ wss.on("connection", (ws) => {
           sampleReady: false,
           voiceId: null,
           cloneStatus: "waiting",
+          lastLoggedSecond: -1,
         });
 
         const audioBuffer = await getCachedIntroAudio();
@@ -107,20 +107,24 @@ wss.on("connection", (ws) => {
         session.rawChunks.push(rawChunk);
         session.rawBytes += rawChunk.length;
 
-        const capturedSeconds = (session.rawBytes / 8000).toFixed(1);
+        const capturedSeconds = session.rawBytes / 8000;
+        const roundedSeconds = Math.floor(capturedSeconds);
 
-        if (
-          !session.sampleReady &&
-          session.rawBytes >= CLONE_TARGET_BYTES
-        ) {
-          session.sampleReady = true;
+        if (roundedSeconds > session.lastLoggedSecond) {
+          session.lastLoggedSecond = roundedSeconds;
           console.log(
-            `clone sample ready for ${session.callSid} (${capturedSeconds}s captured)`
+            `capturing ${session.callSid}: ${capturedSeconds.toFixed(1)}s`
           );
         }
 
-        // optional lighter log, comment out if too noisy
-        // console.log(`capturing ${session.callSid}: ${capturedSeconds}s`);
+        if (!session.sampleReady && session.rawBytes >= CLONE_TARGET_BYTES) {
+          session.sampleReady = true;
+          console.log(
+            `clone sample ready for ${session.callSid} (${capturedSeconds.toFixed(
+              1
+            )}s captured)`
+          );
+        }
       }
 
       if (data.event === "stop") {
