@@ -6,7 +6,6 @@ const { Readable } = require("stream");
 const { WebSocketServer } = require("ws");
 const twilio = require("twilio");
 
-// Dynamic import so this works even though your project is CommonJS
 const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
   ({ ElevenLabsClient }) =>
     new ElevenLabsClient({
@@ -17,9 +16,11 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// This is the voice ID used in ElevenLabs' Twilio cookbook.
-// If it fails, we can swap it for one from your ElevenLabs dashboard.
 const TEST_VOICE_ID = "aMSt68OGf4xUZAnLpTU8";
+const INTRO_TEXT = "you called, so start speaking. i am listening.";
+
+let cachedIntroAudio = null;
+let introAudioReady = false;
 
 app.get("/", (req, res) => {
   res.send("server running");
@@ -61,16 +62,7 @@ wss.on("connection", (ws) => {
         console.log("call started:", data.start.callSid);
 
         const streamSid = data.start.streamSid;
-        const elevenlabs = await elevenlabsClientPromise;
-
-        const response = await elevenlabs.textToSpeech.convert(TEST_VOICE_ID, {
-          modelId: "eleven_flash_v2_5",
-          outputFormat: "ulaw_8000",
-          text: "you called, so start speaking. i am listening.",
-        });
-
-        const readableStream = Readable.from(response);
-        const audioBuffer = await streamToBuffer(readableStream);
+        const audioBuffer = await getCachedIntroAudio();
 
         ws.send(
           JSON.stringify({
@@ -82,7 +74,7 @@ wss.on("connection", (ws) => {
           })
         );
 
-        console.log("sent spoken reply into call");
+        console.log("sent cached spoken reply into call");
       }
 
       if (data.event === "media") {
@@ -102,6 +94,28 @@ wss.on("connection", (ws) => {
   });
 });
 
+async function getCachedIntroAudio() {
+  if (cachedIntroAudio) {
+    return cachedIntroAudio;
+  }
+
+  const elevenlabs = await elevenlabsClientPromise;
+
+  const response = await elevenlabs.textToSpeech.convert(TEST_VOICE_ID, {
+    modelId: "eleven_flash_v2_5",
+    outputFormat: "ulaw_8000",
+    text: INTRO_TEXT,
+  });
+
+  const readableStream = Readable.from(response);
+  cachedIntroAudio = await streamToBuffer(readableStream);
+  introAudioReady = true;
+
+  console.log("cached intro audio ready");
+
+  return cachedIntroAudio;
+}
+
 function streamToBuffer(readableStream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -120,6 +134,12 @@ function streamToBuffer(readableStream) {
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`server listening on port ${PORT}`);
+
+  try {
+    await getCachedIntroAudio();
+  } catch (error) {
+    console.error("failed to pre-cache intro audio:", error);
+  }
 });
