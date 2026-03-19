@@ -17,32 +17,37 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const MIN_CLONE_BYTES = 3 * 8000;
-const SILENCE_CHUNKS_THRESHOLD = 40;
-const SILENCE_AMPLITUDE_THRESHOLD = 5;
+// Use any stock ElevenLabs voice as fallback before clone is ready
+// "Rachel" is a built-in voice — replace with any voice ID from your ElevenLabs library
+var DEFAULT_VOICE_ID = process.env.DEFAULT_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
-const sessions = new Map();
+// 6 seconds of audio at 8000 bytes/sec — ElevenLabs needs at least 4.6s with noise removal
+var MIN_CLONE_BYTES = 6 * 8000;
+var SILENCE_CHUNKS_THRESHOLD = 40;
+var SILENCE_AMPLITUDE_THRESHOLD = 5;
 
-app.get("/", (req, res) => res.send("server running"));
+var sessions = new Map();
 
-app.post("/voice", (req, res) => {
+app.get("/", function (req, res) { res.send("server running"); });
+
+app.post("/voice", function (req, res) {
   console.log("Twilio hit /voice webhook");
-  const twiml = new twilio.twiml.VoiceResponse();
-  const connect = twiml.connect();
+  var twiml = new twilio.twiml.VoiceResponse();
+  var connect = twiml.connect();
   connect.stream({ url: "wss://" + req.headers.host + "/media" });
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/media" });
+var server = http.createServer(app);
+var wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", function (ws) {
   console.log("websocket connected");
 
   ws.on("message", async function (message) {
     try {
-      const data = JSON.parse(message.toString());
+      var data = JSON.parse(message.toString());
 
       if (data.event === "start") {
         var streamSid = data.start.streamSid;
@@ -61,6 +66,7 @@ wss.on("connection", function (ws) {
           isBotSpeaking: false,
           voiceId: null,
           cloneReady: false,
+          cloningInProgress: false,
           history: [],
         });
       }
@@ -77,19 +83,24 @@ wss.on("connection", function (ws) {
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
 
-        // Start clone once we have enough audio
-        if (!session.cloneReady && session.allBytes >= MIN_CLONE_BYTES) {
-          session.cloneReady = true;
+        // Start clone once we have enough audio (only one attempt at a time)
+        if (!session.cloneReady && !session.cloningInProgress && session.allBytes >= MIN_CLONE_BYTES) {
+          session.cloningInProgress = true;
           console.log("cloning voice...");
           var wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
           createInstantVoiceClone(wav, session.callSid)
             .then(function (voiceId) {
               session.voiceId = voiceId;
+              session.cloneReady = true;
+              session.cloningInProgress = false;
               console.log("clone ready: " + voiceId);
             })
             .catch(function (err) {
-              console.error("clone failed:", err);
-              session.cloneReady = false;
+              console.error("clone failed:", err.message);
+              session.cloningInProgress = false;
+              // Reset so it collects another full 6s before retrying
+              session.allBytes = 0;
+              session.allChunks = [];
             });
         }
 
@@ -111,7 +122,8 @@ wss.on("connection", function (ws) {
               session.isSpeaking = false;
               session.silenceChunkCount = 0;
 
-              if (!session.isProcessing && session.voiceId && session.utteranceChunks.length > 0) {
+              // Process even without clone — use default voice as fallback
+              if (!session.isProcessing && session.utteranceChunks.length > 0) {
                 session.isProcessing = true;
                 var utteranceSnapshot = Buffer.concat(session.utteranceChunks);
                 session.utteranceChunks = [];
@@ -175,7 +187,13 @@ async function handleUtterance(session, utteranceBuffer, ws) {
 
     session.history.push({ role: "assistant", content: reply });
 
-    var ttsAudio = await generateTtsAudio(session.voiceId, reply);
+    // Use cloned voice if ready, otherwise fall back to default
+    var voiceToUse = session.voiceId || DEFAULT_VOICE_ID;
+    if (!session.voiceId) {
+      console.log("clone not ready yet, using default voice");
+    }
+
+    var ttsAudio = await generateTtsAudio(voiceToUse, reply);
 
     if (ws.readyState === ws.OPEN) {
       // Clear any queued audio
@@ -199,7 +217,7 @@ async function handleUtterance(session, utteranceBuffer, ws) {
         mark: { name: "reply_done" },
       }));
 
-      console.log("sent reply");
+      console.log("sent reply (voice: " + (session.voiceId ? "clone" : "default") + ")");
     }
   } catch (err) {
     console.error("handleUtterance error:", err);
