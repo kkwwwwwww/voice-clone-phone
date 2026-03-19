@@ -17,9 +17,8 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const MIN_CLONE_BYTES = 8000; // 1 second minimum before responding
-const SILENCE_TIMEOUT_MS = 1500; // 1.5s of no audio = end of utterance
-const ENERGY_THRESHOLD = 3; // sensitivity for voice detection
+const MIN_CLONE_BYTES = 8000; // 1 second of audio minimum
+const PROCESS_INTERVAL_MS = 8000; // process every 8 seconds
 
 const sessions = new Map();
 
@@ -55,9 +54,8 @@ wss.on("connection", (ws) => {
           allChunks: [],
           allBytes: 0,
           utteranceChunks: [],
-          isSpeaking: false,
           isProcessing: false,
-          silenceTimer: null,
+          processingTimer: null,
           voiceId: null,
           cloneGeneration: 0,
           history: [],
@@ -72,41 +70,23 @@ wss.on("connection", (ws) => {
         if (!session || !data.media?.payload) return;
 
         const chunk = Buffer.from(data.media.payload, "base64");
-
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
+        session.utteranceChunks.push(chunk);
 
-        const hasVoice = chunkHasVoice(chunk);
-
-        if (hasVoice) {
-          if (!session.isSpeaking) {
-            session.isSpeaking = true;
+        // Start repeating timer after first second of audio
+        if (!session.processingTimer && session.allBytes >= MIN_CLONE_BYTES) {
+          console.log(`[${session.callSid}] starting processing loop...`);
+          session.processingTimer = setInterval(async () => {
+            if (session.isProcessing || session.utteranceChunks.length === 0) return;
+            session.isProcessing = true;
+            const snap = Buffer.concat(session.utteranceChunks);
             session.utteranceChunks = [];
-            console.log(`[${session.callSid}] speech detected`);
-          }
-          session.utteranceChunks.push(chunk);
-
-          // Reset silence timer every time voice is detected
-          if (session.silenceTimer) {
-            clearTimeout(session.silenceTimer);
-            session.silenceTimer = null;
-          }
-
-          // Start silence timer — fires when caller stops talking
-          session.silenceTimer = setTimeout(() => {
-            if (session.isSpeaking && !session.isProcessing && session.allBytes >= MIN_CLONE_BYTES) {
-              session.isSpeaking = false;
-              session.isProcessing = true;
-              const utteranceSnapshot = Buffer.concat(session.utteranceChunks);
-              session.utteranceChunks = [];
-              console.log(`[${session.callSid}] silence detected, processing...`);
-
-              handleUtterance(session, utteranceSnapshot, ws).catch((err) => {
-                console.error("utterance error:", err);
-                session.isProcessing = false;
-              });
-            }
-          }, SILENCE_TIMEOUT_MS);
+            await handleUtterance(session, snap, ws).catch((err) => {
+              console.error("utterance error:", err);
+              session.isProcessing = false;
+            });
+          }, PROCESS_INTERVAL_MS);
         }
       }
 
@@ -114,7 +94,7 @@ wss.on("connection", (ws) => {
         const streamSid = data.streamSid;
         const session = sessions.get(streamSid);
         if (session) {
-          if (session.silenceTimer) clearTimeout(session.silenceTimer);
+          if (session.processingTimer) clearInterval(session.processingTimer);
           console.log(`call ended: ${session.callSid}`);
           if (session.voiceId) deleteTemporaryVoice(session.voiceId).catch(console.error);
           sessions.delete(streamSid);
@@ -135,6 +115,7 @@ async function handleUtterance(session, utteranceBuffer, ws) {
     console.log(`[${session.callSid}] heard: "${transcription}"`);
 
     if (!transcription || transcription.trim().length === 0) {
+      console.log(`[${session.callSid}] empty transcription, skipping`);
       session.isProcessing = false;
       return;
     }
@@ -162,7 +143,7 @@ async function handleUtterance(session, utteranceBuffer, ws) {
       console.log(`[${session.callSid}] sent reply (gen ${session.cloneGeneration})`);
     }
   } catch (err) {
-    console.error(`[${session.callSid}] error:`, err);
+    console.error(`[${session.callSid}] handleUtterance error:`, err);
   } finally {
     session.isProcessing = false;
   }
@@ -266,14 +247,6 @@ async function generateTtsAudio(voiceId, text) {
   });
   const readable = Readable.from(response);
   return streamToBuffer(readable);
-}
-
-function chunkHasVoice(chunk) {
-  let energy = 0;
-  for (let i = 0; i < chunk.length; i++) {
-    energy += Math.abs((chunk[i] & 0xff) - 127);
-  }
-  return (energy / chunk.length) > ENERGY_THRESHOLD;
 }
 
 function mulawBufferToPcmWav(mulawBuffer) {
