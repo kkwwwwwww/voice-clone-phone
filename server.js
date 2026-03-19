@@ -19,11 +19,11 @@ app.use(express.urlencoded({ extended: false }));
 
 // --- Config ---
 // Minimum bytes before we attempt a first clone (about 3s of speech)
-const MIN_CLONE_BYTES = 3 * 8000;
+const MIN_CLONE_BYTES = 1 * 8000;
 // Silence detection: how many consecutive silent chunks = end of utterance
-const SILENCE_CHUNKS_THRESHOLD = 40; // ~40 * 20ms = ~800ms silence
+const SILENCE_CHUNKS_THRESHOLD = 20; // ~40 * 20ms = ~800ms silence
 // Amplitude threshold for silence detection (mulaw, 0-255, 127 = silence)
-const SILENCE_AMPLITUDE_THRESHOLD = 5;
+const SILENCE_AMPLITUDE_THRESHOLD = 2;
 
 const sessions = new Map();
 
@@ -309,10 +309,11 @@ async function generateTtsAudio(voiceId, text) {
 // --- VAD ---
 
 function chunkHasVoice(chunk) {
-  // mulaw: 127 = silence. Measure deviation from silence.
+// mulaw: 127 = silence. Measure deviation from silence.
   let energy = 0;
   for (let i = 0; i < chunk.length; i++) {
-    energy += Math.abs(chunk[i] - 127);
+    const val = chunk[i] & 0xff;
+    energy += Math.abs(val - 127);
   }
   const avgEnergy = energy / chunk.length;
   return avgEnergy > SILENCE_AMPLITUDE_THRESHOLD;
