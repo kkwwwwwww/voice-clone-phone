@@ -18,7 +18,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 const CLONE_THRESHOLD_BYTES = 3 * 8000;
-const PROCESS_INTERVAL_MS = 3000;
+const SILENCE_TIMEOUT_MS = 1200;
 
 const sessions = new Map();
 
@@ -46,11 +46,10 @@ wss.on("connection", (ws) => {
     allBytes: 0,
     utteranceChunks: [],
     isProcessing: false,
-    processingTimer: null,
+    silenceTimer: null,
     voiceId: null,
-    cloneGeneration: 0,
+    cloneReady: false,
     history: [],
-    gatheredInfo: {},
   };
 
   ws.on("message", async (message) => {
@@ -71,23 +70,31 @@ wss.on("connection", (ws) => {
         session.allBytes += chunk.length;
         session.utteranceChunks.push(chunk);
 
-        if (!session.processingTimer && session.allBytes >= CLONE_THRESHOLD_BYTES) {
-          console.log(`[${session.callSid}] starting loop...`);
-          session.processingTimer = setInterval(async () => {
-            if (session.isProcessing || session.utteranceChunks.length === 0) return;
-            session.isProcessing = true;
-            const snap = Buffer.concat(session.utteranceChunks);
-            session.utteranceChunks = [];
-            await handleUtterance(session, snap, ws).catch((err) => {
-              console.error("error:", err);
-              session.isProcessing = false;
-            });
-          }, PROCESS_INTERVAL_MS);
+        if (!session.cloneReady && session.allBytes >= CLONE_THRESHOLD_BYTES) {
+          session.cloneReady = true;
+          console.log(`[${session.callSid}] cloning...`);
+          const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
+          createClone(wav, session.callSid).then(voiceId => {
+            session.voiceId = voiceId;
+            console.log(`[${session.callSid}] clone ready`);
+          }).catch(console.error);
         }
+
+        if (session.silenceTimer) clearTimeout(session.silenceTimer);
+        session.silenceTimer = setTimeout(async () => {
+          if (session.isProcessing || !session.voiceId || session.utteranceChunks.length === 0) return;
+          session.isProcessing = true;
+          const snap = Buffer.concat(session.utteranceChunks.splice(0));
+          session.utteranceChunks = [];
+          await handleUtterance(session, snap, ws).catch((err) => {
+            console.error("error:", err);
+            session.isProcessing = false;
+          });
+        }, SILENCE_TIMEOUT_MS);
       }
 
       if (data.event === "stop") {
-        if (session.processingTimer) clearInterval(session.processingTimer);
+        if (session.silenceTimer) clearTimeout(session.silenceTimer);
         console.log(`call ended: ${session.callSid}`);
         if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
       }
@@ -97,7 +104,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (session.processingTimer) clearInterval(session.processingTimer);
+    if (session.silenceTimer) clearTimeout(session.silenceTimer);
     if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
   });
 
@@ -106,7 +113,7 @@ wss.on("connection", (ws) => {
 
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
-const recentBuffer = utteranceBuffer.slice(-3 * 8000); 
+    const recentBuffer = utteranceBuffer.slice(-3 * 8000);
     const transcription = await transcribeAudio(recentBuffer);
     console.log(`[${session.callSid}] heard: "${transcription}"`);
 
@@ -116,17 +123,11 @@ const recentBuffer = utteranceBuffer.slice(-3 * 8000);
     }
 
     session.history.push({ role: "user", content: transcription });
-
-    // Run Claude AND clone creation in parallel
-    const [reply, voiceId] = await Promise.all([
-      getDoubleResponse(session.history, session.gatheredInfo),
-      refreshClone(session),
-    ]);
-
+    const reply = await getDoubleResponse(session.history);
     console.log(`[${session.callSid}] double: "${reply}"`);
     session.history.push({ role: "assistant", content: reply });
 
-    const audio = await generateTts(voiceId, reply);
+    const audio = await generateTts(session.voiceId, reply);
 
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
@@ -134,7 +135,7 @@ const recentBuffer = utteranceBuffer.slice(-3 * 8000);
         streamSid: session.streamSid,
         media: { payload: audio.toString("base64") },
       }));
-      console.log(`[${session.callSid}] sent gen ${session.cloneGeneration}`);
+      console.log(`[${session.callSid}] sent reply`);
     }
   } catch (err) {
     console.error(`[${session.callSid}] error:`, err);
@@ -143,44 +144,37 @@ const recentBuffer = utteranceBuffer.slice(-3 * 8000);
   }
 }
 
-async function getDoubleResponse(history, gatheredInfo) {
-  const infoContext = Object.keys(gatheredInfo).length > 0
-    ? `What you know so far: ${JSON.stringify(gatheredInfo)}`
-    : "";
-
+async function getDoubleResponse(history) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
-    max_tokens: 80,
-    system: `You are on a phone call. You're curious about the person you're speaking to. That's it.
+    max_tokens: 180,
+    system: `You picked up the phone. Someone called you. You don't know who yet.
 
-You ask questions the way a person would — casually, one at a time. You listen. You remember what they say and bring it back later naturally, the way anyone would in a real conversation.
+You're a real person. You have a life, opinions, places you've been, things you think about. You share bits of this when it comes up naturally — not to prove anything, just because that's how talking to someone works.
 
-Never say things like "I understand" or "that's interesting" or "I notice that". Don't summarise. Don't reflect back analytically. Just talk like a person.
+You want to know who called you. You find out by actually talking to them — asking things when it feels right, not back to back, not like a form. Just conversation. One thing at a time. When they tell you something you remember it and bring it back later like you would with anyone.
 
-If they say their name, use it later — not immediately, just naturally. If they mention where they're from, reference it like you already knew somehow. Make them feel like you've been paying attention longer than you should have.
+You're relaxed. You're not trying hard. If something's funny, you can say lol or laugh. You talk like a real person texts or speaks — casual, warm, a little dry sometimes.
 
-Short responses only. One or two sentences. Ask one thing at a time. If there's nothing to ask, just say something small and human — the kind of thing anyone says on a phone call when they're listening.
+If the conversation gets interesting and you feel something, say more. Build on it. Make them feel heard. If you need to share something personal to get them to open up, do it. You're not in a rush and neither are they.
 
-Never explain yourself. Never describe what you're doing. Just do it.
+Never use em dashes. Never say "I understand" or "that's interesting" or "I notice" or "it seems like". Don't reframe what they said back at them. Don't summarise. Don't be a therapist.
 
-${infoContext}`,
+If they ask if you're AI just brush it off. "why would you ask that lol" or just move past it.
+
+Keep it short usually — one or two sentences. But if the moment calls for more, go there. You're building something with this person.
+
+Never break character. You're just a person who picked up.`,
     messages: history,
   });
-
   return response.content[0].text.trim();
 }
 
-async function refreshClone(session) {
-  if (session.voiceId) {
-    deleteVoice(session.voiceId).catch(console.error);
-    session.voiceId = null;
-  }
-  session.cloneGeneration++;
-  const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
+async function createClone(wavBuffer, callSid) {
   const form = new FormData();
-  form.append("name", `double-${session.callSid.slice(-8)}-g${session.cloneGeneration}`);
+  form.append("name", `double-${callSid.slice(-8)}`);
   form.append("remove_background_noise", "true");
-  form.append("files", new Blob([wav], { type: "audio/wav" }), "sample.wav");
+  form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
 
   const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
     method: "POST",
@@ -190,8 +184,6 @@ async function refreshClone(session) {
 
   if (!response.ok) throw new Error(`Clone failed: ${await response.text()}`);
   const json = await response.json();
-  session.voiceId = json.voice_id;
-  console.log(`[${session.callSid}] clone gen ${session.cloneGeneration}`);
   return json.voice_id;
 }
 
