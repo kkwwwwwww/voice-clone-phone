@@ -214,11 +214,13 @@ function mulawToPcm16000(mulawBuffer) {
   return buffer;
 }
 
-// PCM/16000 from ElevenLabs → mulaw/8000 for Twilio
 function pcm16000ToMulaw(pcmBuffer) {
-  const sampleCount = Math.floor(pcmBuffer.length / 4);
-  const mulawBuffer = Buffer.alloc(sampleCount);
-  for (let i = 0; i < sampleCount; i++) {
+  // ElevenLabs sends 16-bit PCM at 16000Hz
+  // Downsample to 8000Hz and encode as mulaw for Twilio
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  const downsampled = Math.floor(sampleCount / 2);
+  const mulawBuffer = Buffer.alloc(downsampled);
+  for (let i = 0; i < downsampled; i++) {
     const sample = pcmBuffer.readInt16LE(i * 4);
     mulawBuffer[i] = muLawEncode(sample);
   }
