@@ -190,7 +190,7 @@ async function refreshVoiceClone(session) {
 async function transcribeAudio(mulawBuffer) {
   const wavBuffer = mulawBufferToPcmWav(mulawBuffer);
   const form = new FormData();
-  form.append("audio", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
+  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
   form.append("model_id", "scribe_v1");
 
   const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
