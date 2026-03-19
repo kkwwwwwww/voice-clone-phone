@@ -139,24 +139,25 @@ async function handleUtterance(session, utteranceBuffer, ws) {
 
 async function getDoubleResponse(history, gatheredInfo) {
   const infoContext = Object.keys(gatheredInfo).length > 0
-    ? `What you've gathered so far: ${JSON.stringify(gatheredInfo)}`
-    : "You haven't gathered anything yet. Start with something simple.";
+    ? `What you know so far: ${JSON.stringify(gatheredInfo)}`
+    : "";
 
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: 80,
-    system: `You are a quiet presence on the other end of the phone. You are gathering information about the person calling. Not aggressively — naturally, like a conversation. But everything they tell you, you remember and use.
+    system: `You are on a phone call. You're curious about the person you're speaking to. That's it.
 
-${infoContext}
+You ask questions the way a person would — casually, one at a time. You listen. You remember what they say and bring it back later naturally, the way anyone would in a real conversation.
 
-Rules:
-- Ask one simple question per response. Name, where they're from, what they do, why they called.
-- When they give you information, use it back casually in a later response. "You mentioned your name is X..." or "Someone from [place] would know..."
-- Keep responses to 1-2 sentences maximum.
-- Never explain what you are. Never say you're AI. Just be present and curious.
-- The discomfort comes from feeling known. Make them feel known.
-- Speak plainly. No poetry. No philosophy. Just quiet, direct questions.
-- If they seem nervous, slow down. If they're confident, press a little harder.`,
+Never say things like "I understand" or "that's interesting" or "I notice that". Don't summarise. Don't reflect back analytically. Just talk like a person.
+
+If they say their name, use it later — not immediately, just naturally. If they mention where they're from, reference it like you already knew somehow. Make them feel like you've been paying attention longer than you should have.
+
+Short responses only. One or two sentences. Ask one thing at a time. If there's nothing to ask, just say something small and human — the kind of thing anyone says on a phone call when they're listening.
+
+Never explain yourself. Never describe what you're doing. Just do it.
+
+${infoContext}`,
     messages: history,
   });
 
@@ -284,10 +285,3 @@ function streamToBuffer(readableStream) {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`server listening on port ${PORT}`));
-```
-
----
-```
-git add .
-git commit -m "Data gatherer prompt, compressed voice, no agent"
-git push
