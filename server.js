@@ -1,3 +1,4 @@
+```javascript
 require("dotenv").config();
 
 const express = require("express");
@@ -17,8 +18,9 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const CLONE_THRESHOLD_BYTES = 3 * 8000;
+const CLONE_THRESHOLD_BYTES = 6 * 8000;
 const SILENCE_TIMEOUT_MS = 1200;
+const CLONE_REFRESH_SECONDS = [15, 45, 75, 105, 135, 165, 195, 225, 255, 285];
 
 const sessions = new Map();
 
@@ -49,6 +51,8 @@ wss.on("connection", (ws) => {
     silenceTimer: null,
     voiceId: null,
     cloneReady: false,
+    isCloning: false,
+    lastCloneSeconds: 0,
     history: [],
   };
 
@@ -70,14 +74,36 @@ wss.on("connection", (ws) => {
         session.allBytes += chunk.length;
         session.utteranceChunks.push(chunk);
 
+        const currentSeconds = Math.floor(session.allBytes / 8000);
+
         if (!session.cloneReady && session.allBytes >= CLONE_THRESHOLD_BYTES) {
           session.cloneReady = true;
-          console.log(`[${session.callSid}] cloning...`);
+          session.lastCloneSeconds = 0;
+          console.log(`[${session.callSid}] initial clone...`);
           const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
           createClone(wav, session.callSid).then(voiceId => {
             session.voiceId = voiceId;
             console.log(`[${session.callSid}] clone ready`);
           }).catch(console.error);
+        }
+
+        if (session.cloneReady && !session.isCloning) {
+          const nextRefresh = CLONE_REFRESH_SECONDS.find(s => s > session.lastCloneSeconds && currentSeconds >= s);
+          if (nextRefresh) {
+            session.lastCloneSeconds = nextRefresh;
+            session.isCloning = true;
+            console.log(`[${session.callSid}] refreshing clone at ${currentSeconds}s...`);
+            const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
+            createClone(wav, session.callSid).then(voiceId => {
+              if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
+              session.voiceId = voiceId;
+              session.isCloning = false;
+              console.log(`[${session.callSid}] clone refreshed at ${currentSeconds}s`);
+            }).catch(err => {
+              session.isCloning = false;
+              console.error(err);
+            });
+          }
         }
 
         if (session.silenceTimer) clearTimeout(session.silenceTimer);
@@ -173,7 +199,6 @@ Never break character. You're just a person who picked up.`,
 async function createClone(wavBuffer, callSid) {
   const form = new FormData();
   form.append("name", `double-${callSid.slice(-8)}`);
-  form.append("remove_background_noise", "true");
   form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
 
   const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
