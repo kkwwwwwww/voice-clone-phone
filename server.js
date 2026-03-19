@@ -17,8 +17,8 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const CLONE_THRESHOLD_BYTES = 5 * 8000;
-const PROCESS_INTERVAL_MS = 5000;
+const CLONE_THRESHOLD_BYTES = 3 * 8000;
+const PROCESS_INTERVAL_MS = 3000;
 
 const sessions = new Map();
 
@@ -115,11 +115,16 @@ async function handleUtterance(session, utteranceBuffer, ws) {
     }
 
     session.history.push({ role: "user", content: transcription });
-    const reply = await getDoubleResponse(session.history, session.gatheredInfo);
+
+    // Run Claude AND clone creation in parallel
+    const [reply, voiceId] = await Promise.all([
+      getDoubleResponse(session.history, session.gatheredInfo),
+      refreshClone(session),
+    ]);
+
     console.log(`[${session.callSid}] double: "${reply}"`);
     session.history.push({ role: "assistant", content: reply });
 
-    const voiceId = await refreshClone(session);
     const audio = await generateTts(voiceId, reply);
 
     if (ws.readyState === ws.OPEN) {
