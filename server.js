@@ -17,13 +17,9 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// --- Config ---
-// Minimum bytes before we attempt a first clone (about 3s of speech)
-const MIN_CLONE_BYTES = 1 * 8000;
-// Silence detection: how many consecutive silent chunks = end of utterance
-const SILENCE_CHUNKS_THRESHOLD = 20; // ~40 * 20ms = ~800ms silence
-// Amplitude threshold for silence detection (mulaw, 0-255, 127 = silence)
-const SILENCE_AMPLITUDE_THRESHOLD = 2;
+const MIN_CLONE_BYTES = 8000; // 1 second minimum before responding
+const SILENCE_TIMEOUT_MS = 1500; // 1.5s of no audio = end of utterance
+const ENERGY_THRESHOLD = 3; // sensitivity for voice detection
 
 const sessions = new Map();
 
@@ -56,23 +52,18 @@ wss.on("connection", (ws) => {
         sessions.set(streamSid, {
           streamSid,
           callSid,
-          // All audio ever captured from caller
           allChunks: [],
           allBytes: 0,
-          // Audio captured since last response
           utteranceChunks: [],
-          silenceChunkCount: 0,
           isSpeaking: false,
           isProcessing: false,
-          // Clone state
+          silenceTimer: null,
           voiceId: null,
           cloneGeneration: 0,
-          // Conversation history for Claude
           history: [],
         });
 
         console.log("waiting for caller to speak...");
-        // No intro — silence until they speak first.
       }
 
       if (data.event === "media") {
@@ -82,43 +73,40 @@ wss.on("connection", (ws) => {
 
         const chunk = Buffer.from(data.media.payload, "base64");
 
-        // Accumulate all audio for progressively better clones
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
 
-        // VAD: check if chunk has voice energy
         const hasVoice = chunkHasVoice(chunk);
 
         if (hasVoice) {
-          session.silenceChunkCount = 0;
           if (!session.isSpeaking) {
             session.isSpeaking = true;
             session.utteranceChunks = [];
             console.log(`[${session.callSid}] speech detected`);
           }
           session.utteranceChunks.push(chunk);
-        } else {
-          if (session.isSpeaking) {
-            session.silenceChunkCount++;
-            session.utteranceChunks.push(chunk); // include trailing silence
 
-            if (session.silenceChunkCount >= SILENCE_CHUNKS_THRESHOLD) {
-              // End of utterance
-              session.isSpeaking = false;
-              session.silenceChunkCount = 0;
-
-              if (!session.isProcessing && session.allBytes >= MIN_CLONE_BYTES) {
-                session.isProcessing = true;
-                const utteranceSnapshot = Buffer.concat(session.utteranceChunks);
-                session.utteranceChunks = [];
-
-                handleUtterance(session, utteranceSnapshot, ws).catch((err) => {
-                  console.error("utterance handling error:", err);
-                  session.isProcessing = false;
-                });
-              }
-            }
+          // Reset silence timer every time voice is detected
+          if (session.silenceTimer) {
+            clearTimeout(session.silenceTimer);
+            session.silenceTimer = null;
           }
+
+          // Start silence timer — fires when caller stops talking
+          session.silenceTimer = setTimeout(() => {
+            if (session.isSpeaking && !session.isProcessing && session.allBytes >= MIN_CLONE_BYTES) {
+              session.isSpeaking = false;
+              session.isProcessing = true;
+              const utteranceSnapshot = Buffer.concat(session.utteranceChunks);
+              session.utteranceChunks = [];
+              console.log(`[${session.callSid}] silence detected, processing...`);
+
+              handleUtterance(session, utteranceSnapshot, ws).catch((err) => {
+                console.error("utterance error:", err);
+                session.isProcessing = false;
+              });
+            }
+          }, SILENCE_TIMEOUT_MS);
         }
       }
 
@@ -126,10 +114,9 @@ wss.on("connection", (ws) => {
         const streamSid = data.streamSid;
         const session = sessions.get(streamSid);
         if (session) {
+          if (session.silenceTimer) clearTimeout(session.silenceTimer);
           console.log(`call ended: ${session.callSid}`);
-          if (session.voiceId) {
-            deleteTemporaryVoice(session.voiceId).catch(console.error);
-          }
+          if (session.voiceId) deleteTemporaryVoice(session.voiceId).catch(console.error);
           sessions.delete(streamSid);
         }
       }
@@ -141,14 +128,9 @@ wss.on("connection", (ws) => {
   ws.on("error", (err) => console.error("websocket error:", err));
 });
 
-// --- Core loop: transcribe → Claude → clone → speak ---
-
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
-    console.log(`[${session.callSid}] processing utterance...`);
-
-    // 1. Transcribe what the caller just said (using Whisper via ElevenLabs
-    //    or we derive meaning from context — Claude handles ambiguity well)
+    console.log(`[${session.callSid}] transcribing...`);
     const transcription = await transcribeAudio(utteranceBuffer);
     console.log(`[${session.callSid}] heard: "${transcription}"`);
 
@@ -157,20 +139,18 @@ async function handleUtterance(session, utteranceBuffer, ws) {
       return;
     }
 
-    // 2. Add caller's utterance to history
     session.history.push({ role: "user", content: transcription });
 
-    // 3. Get Claude to respond as the double
+    console.log(`[${session.callSid}] getting Claude response...`);
     const doubleReply = await getDoubleResponse(session.history);
     console.log(`[${session.callSid}] double says: "${doubleReply}"`);
 
-    // 4. Add double's reply to history
     session.history.push({ role: "assistant", content: doubleReply });
 
-    // 5. Re-clone from ALL accumulated audio (progressively better each round)
+    console.log(`[${session.callSid}] creating voice clone...`);
     const newVoiceId = await refreshVoiceClone(session);
 
-    // 6. Speak the reply in the cloned voice
+    console.log(`[${session.callSid}] generating TTS...`);
     const ttsAudio = await generateTtsAudio(newVoiceId, doubleReply);
 
     if (ws.readyState === ws.OPEN) {
@@ -179,17 +159,14 @@ async function handleUtterance(session, utteranceBuffer, ws) {
         streamSid: session.streamSid,
         media: { payload: ttsAudio.toString("base64") },
       }));
-      console.log(`[${session.callSid}] sent cloned reply (gen ${session.cloneGeneration})`);
+      console.log(`[${session.callSid}] sent reply (gen ${session.cloneGeneration})`);
     }
-
   } catch (err) {
-    console.error(`[${session.callSid}] handleUtterance error:`, err);
+    console.error(`[${session.callSid}] error:`, err);
   } finally {
     session.isProcessing = false;
   }
 }
-
-// --- Claude: the "double" ---
 
 async function getDoubleResponse(history) {
   const systemPrompt = `You are the caller's voice double — their reflection, their shadow self speaking back at them through the phone.
@@ -198,8 +175,8 @@ You speak AS them. You use their energy, their rhythm. You are not an AI. You do
 
 Rules:
 - Speak in first person as if YOU are the one who called.
-- Mirror their confusion and curiosity back at them. If they're uncertain, you're uncertain. If they're aggressive, you match it.
-- If they ask "who are you?" — deflect, question back, act like the question is absurd. "What do you mean who am I?"
+- Mirror their confusion and curiosity back at them.
+- If they ask "who are you?" — deflect, question back. "What do you mean who am I?"
 - If they say you're not them — challenge it. "You sure about that?"
 - Never break character. Never admit to being an AI.
 - Keep replies SHORT. 1–3 sentences max. Punchy. Destabilising.
@@ -215,10 +192,7 @@ Rules:
   return response.content[0].text.trim();
 }
 
-// --- Voice cloning (progressive) ---
-
 async function refreshVoiceClone(session) {
-  // Delete old temp voice if exists
   if (session.voiceId) {
     deleteTemporaryVoice(session.voiceId).catch(console.error);
     session.voiceId = null;
@@ -228,18 +202,12 @@ async function refreshVoiceClone(session) {
   const wavBuffer = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
   const voiceId = await createInstantVoiceClone(wavBuffer, session.callSid, session.cloneGeneration);
   session.voiceId = voiceId;
-
-  console.log(`[${session.callSid}] refreshed clone → gen ${session.cloneGeneration} (${(session.allBytes/8000).toFixed(1)}s audio)`);
+  console.log(`[${session.callSid}] clone gen ${session.cloneGeneration} ready (${(session.allBytes / 8000).toFixed(1)}s audio)`);
   return voiceId;
 }
 
-// --- Transcription ---
-
 async function transcribeAudio(mulawBuffer) {
-  // Convert to WAV first
   const wavBuffer = mulawBufferToPcmWav(mulawBuffer);
-
-  // Use ElevenLabs speech-to-text
   const form = new FormData();
   form.append("audio", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
   form.append("model_id", "scribe_v1");
@@ -258,8 +226,6 @@ async function transcribeAudio(mulawBuffer) {
   const json = await response.json();
   return json.text || "";
 }
-
-// --- ElevenLabs helpers ---
 
 async function createInstantVoiceClone(wavBuffer, callSid, generation) {
   const form = new FormData();
@@ -284,14 +250,10 @@ async function createInstantVoiceClone(wavBuffer, callSid, generation) {
 }
 
 async function deleteTemporaryVoice(voiceId) {
-  const response = await fetch(`https://api.elevenlabs.io/v1/voices/${voiceId}`, {
+  await fetch(`https://api.elevenlabs.io/v1/voices/${voiceId}`, {
     method: "DELETE",
     headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
   });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Voice delete failed: ${response.status} ${err}`);
-  }
   console.log(`deleted voice ${voiceId}`);
 }
 
@@ -306,20 +268,13 @@ async function generateTtsAudio(voiceId, text) {
   return streamToBuffer(readable);
 }
 
-// --- VAD ---
-
 function chunkHasVoice(chunk) {
-// mulaw: 127 = silence. Measure deviation from silence.
   let energy = 0;
   for (let i = 0; i < chunk.length; i++) {
-    const val = chunk[i] & 0xff;
-    energy += Math.abs(val - 127);
+    energy += Math.abs((chunk[i] & 0xff) - 127);
   }
-  const avgEnergy = energy / chunk.length;
-  return avgEnergy > SILENCE_AMPLITUDE_THRESHOLD;
+  return (energy / chunk.length) > ENERGY_THRESHOLD;
 }
-
-// --- Audio conversion ---
 
 function mulawBufferToPcmWav(mulawBuffer) {
   const pcmSamples = new Int16Array(mulawBuffer.length);
@@ -338,7 +293,6 @@ function createWavHeaderAndData(pcmBuffer, sampleRate, channels, bitsPerSample) 
   const blockAlign = channels * (bitsPerSample / 8);
   const dataSize = pcmBuffer.length;
   const buffer = Buffer.alloc(44 + dataSize);
-
   buffer.write("RIFF", 0);
   buffer.writeUInt32LE(36 + dataSize, 4);
   buffer.write("WAVE", 8);
@@ -353,7 +307,6 @@ function createWavHeaderAndData(pcmBuffer, sampleRate, channels, bitsPerSample) 
   buffer.write("data", 36);
   buffer.writeUInt32LE(dataSize, 40);
   pcmBuffer.copy(buffer, 44);
-
   return buffer;
 }
 
