@@ -19,7 +19,6 @@ app.use(express.urlencoded({ extended: false }));
 
 const CLONE_THRESHOLD_BYTES = 6 * 8000;
 const SILENCE_TIMEOUT_MS = 1200;
-const CLONE_REFRESH_SECONDS = [15, 45, 75, 105, 135, 165, 195, 225, 255, 285];
 
 const sessions = new Map();
 
@@ -29,7 +28,8 @@ app.post("/voice", (req, res) => {
   console.log("Twilio hit /voice webhook");
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
-  connect.stream({ url: "wss://" + req.headers.host + "/media" });
+  const host = req.headers.host;
+  connect.stream({ url: "wss://" + host + "/media" });
   res.type("text/xml");
   res.send(twiml.toString());
 });
@@ -50,8 +50,6 @@ wss.on("connection", (ws) => {
     silenceTimer: null,
     voiceId: null,
     cloneReady: false,
-    isCloning: false,
-    lastCloneSeconds: 0,
     history: [],
   };
 
@@ -73,38 +71,14 @@ wss.on("connection", (ws) => {
         session.allBytes += chunk.length;
         session.utteranceChunks.push(chunk);
 
-        const currentSeconds = Math.floor(session.allBytes / 8000);
-
         if (!session.cloneReady && session.allBytes >= CLONE_THRESHOLD_BYTES) {
           session.cloneReady = true;
-          session.lastCloneSeconds = 0;
-          console.log("initial clone...");
+          console.log("cloning...");
           const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
           createClone(wav, session.callSid).then(function(voiceId) {
             session.voiceId = voiceId;
             console.log("clone ready");
           }).catch(console.error);
-        }
-
-        if (session.cloneReady && !session.isCloning) {
-          const nextRefresh = CLONE_REFRESH_SECONDS.find(function(s) {
-            return s > session.lastCloneSeconds && currentSeconds >= s;
-          });
-          if (nextRefresh) {
-            session.lastCloneSeconds = nextRefresh;
-            session.isCloning = true;
-            console.log("refreshing clone at " + currentSeconds + "s...");
-            const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-            createClone(wav, session.callSid).then(function(voiceId) {
-              if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
-              session.voiceId = voiceId;
-              session.isCloning = false;
-              console.log("clone refreshed at " + currentSeconds + "s");
-            }).catch(function(err) {
-              session.isCloning = false;
-              console.error(err);
-            });
-          }
         }
 
         if (session.silenceTimer) clearTimeout(session.silenceTimer);
@@ -175,7 +149,7 @@ async function getDoubleResponse(history) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: 180,
-    system: "You picked up the phone. Someone called you. You don't know who yet.\n\nYou're a real person. You have a life, opinions, places you've been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou're relaxed. Not trying hard. If something's funny, you can say lol. You talk like a real person.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that's interesting or I notice or it seems like. Don't summarise. Don't be a therapist.\n\nIf they ask if you're AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You're just a person who picked up.",
+    system: "You picked up the phone. Someone called you. You don't know who yet.\n\nYou are a real person. You have a life, opinions, places you have been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou are relaxed. Not trying hard. If something is funny, you can say lol. You talk like a real person texts or speaks.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that is interesting or I notice or it seems like. Do not summarise. Do not be a therapist.\n\nIf they ask if you are AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You are just a person who picked up.",
     messages: history,
   });
   return response.content[0].text.trim();
@@ -293,4 +267,3 @@ function streamToBuffer(readableStream) {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, function() { console.log("server listening on port " + PORT); });
-
