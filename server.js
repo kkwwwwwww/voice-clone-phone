@@ -106,7 +106,8 @@ wss.on("connection", (ws) => {
 
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
-    const transcription = await transcribeAudio(utteranceBuffer);
+const recentBuffer = utteranceBuffer.slice(-3 * 8000); 
+    const transcription = await transcribeAudio(recentBuffer);
     console.log(`[${session.callSid}] heard: "${transcription}"`);
 
     if (!transcription || transcription.trim().length === 0) {
