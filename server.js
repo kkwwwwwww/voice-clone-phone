@@ -17,8 +17,11 @@ const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const CLONE_THRESHOLD_BYTES = 6 * 8000;
-const SILENCE_TIMEOUT_MS = 1200;
+const MIN_CLONE_BYTES = 3 * 8000;
+const SILENCE_CHUNKS_THRESHOLD = 40;
+const SILENCE_AMPLITUDE_THRESHOLD = 5;
+
+const sessions = new Map();
 
 app.get("/", (req, res) => res.send("server running"));
 
@@ -26,8 +29,7 @@ app.post("/voice", (req, res) => {
   console.log("Twilio hit /voice webhook");
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
-  const host = req.headers.host;
-  connect.stream({ url: "wss://" + host + "/media" });
+  connect.stream({ url: "wss://" + req.headers.host + "/media" });
   res.type("text/xml");
   res.send(twiml.toString());
 });
@@ -35,229 +37,275 @@ app.post("/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
-wss.on("connection", (ws) => {
-  console.log("Twilio websocket connected");
+wss.on("connection", function (ws) {
+  console.log("websocket connected");
 
-  let session = {
-    streamSid: null,
-    callSid: null,
-    allChunks: [],
-    allBytes: 0,
-    utteranceChunks: [],
-    isProcessing: false,
-    isSpeaking: false,
-    silenceTimer: null,
-    voiceId: null,
-    cloneReady: false,
-    history: [],
-  };
-
-  function triggerProcessing() {
-    if (session.isProcessing || session.isSpeaking || !session.voiceId || session.utteranceChunks.length === 0) return;
-    session.isProcessing = true;
-    const snap = Buffer.concat(session.utteranceChunks.splice(0));
-    session.utteranceChunks = [];
-    handleUtterance(session, snap, ws).catch(function(err) {
-      console.error("error:", err);
-      session.isProcessing = false;
-    });
-  }
-
-  ws.on("message", async (message) => {
+  ws.on("message", async function (message) {
     try {
       const data = JSON.parse(message.toString());
 
       if (data.event === "start") {
-        session.streamSid = data.start.streamSid;
-        session.callSid = data.start.callSid;
-        console.log("call started:", session.callSid);
-      }
+        var streamSid = data.start.streamSid;
+        var callSid = data.start.callSid;
+        console.log("call started:", callSid);
 
-      if (data.event === "mark") {
-        // Bot finished speaking — stop suppressing input
-        session.isSpeaking = false;
-        console.log("bot done speaking");
-        // Re-trigger in case caller spoke during reply
-        if (session.utteranceChunks.length > 0) {
-          triggerProcessing();
-        }
+        sessions.set(streamSid, {
+          streamSid: streamSid,
+          callSid: callSid,
+          allChunks: [],
+          allBytes: 0,
+          utteranceChunks: [],
+          silenceChunkCount: 0,
+          isSpeaking: false,
+          isProcessing: false,
+          isBotSpeaking: false,
+          voiceId: null,
+          cloneReady: false,
+          history: [],
+        });
       }
 
       if (data.event === "media") {
-        if (!data.media || !data.media.payload) return;
+        var session = sessions.get(data.streamSid);
+        if (!session || !data.media || !data.media.payload) return;
 
-        // Ignore incoming audio while bot is speaking (echo suppression)
-        if (session.isSpeaking) return;
+        // Echo suppression: ignore audio while bot is talking
+        if (session.isBotSpeaking) return;
 
-        const chunk = Buffer.from(data.media.payload, "base64");
+        var chunk = Buffer.from(data.media.payload, "base64");
+
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
-        session.utteranceChunks.push(chunk);
 
-        if (!session.cloneReady && session.allBytes >= CLONE_THRESHOLD_BYTES) {
+        // Start clone once we have enough audio
+        if (!session.cloneReady && session.allBytes >= MIN_CLONE_BYTES) {
           session.cloneReady = true;
-          console.log("cloning...");
-          const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-          createClone(wav, session.callSid).then(function(voiceId) {
-            session.voiceId = voiceId;
-            console.log("clone ready");
-            // Re-trigger if caller already spoke while cloning
-            if (session.utteranceChunks.length > 0 && !session.isProcessing) {
-              triggerProcessing();
-            }
-          }).catch(console.error);
+          console.log("cloning voice...");
+          var wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
+          createInstantVoiceClone(wav, session.callSid)
+            .then(function (voiceId) {
+              session.voiceId = voiceId;
+              console.log("clone ready: " + voiceId);
+            })
+            .catch(function (err) {
+              console.error("clone failed:", err);
+              session.cloneReady = false;
+            });
         }
 
-        if (session.silenceTimer) clearTimeout(session.silenceTimer);
-        session.silenceTimer = setTimeout(function() {
-          triggerProcessing();
-        }, SILENCE_TIMEOUT_MS);
+        var hasVoice = chunkHasVoice(chunk);
+
+        if (hasVoice) {
+          session.silenceChunkCount = 0;
+          if (!session.isSpeaking) {
+            session.isSpeaking = true;
+            session.utteranceChunks = [];
+          }
+          session.utteranceChunks.push(chunk);
+        } else {
+          if (session.isSpeaking) {
+            session.silenceChunkCount++;
+            session.utteranceChunks.push(chunk);
+
+            if (session.silenceChunkCount >= SILENCE_CHUNKS_THRESHOLD) {
+              session.isSpeaking = false;
+              session.silenceChunkCount = 0;
+
+              if (!session.isProcessing && session.voiceId && session.utteranceChunks.length > 0) {
+                session.isProcessing = true;
+                var utteranceSnapshot = Buffer.concat(session.utteranceChunks);
+                session.utteranceChunks = [];
+
+                handleUtterance(session, utteranceSnapshot, ws).catch(function (err) {
+                  console.error("utterance error:", err);
+                  session.isProcessing = false;
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // Mark event: bot finished speaking
+      if (data.event === "mark" && data.mark && data.mark.name === "reply_done") {
+        var session = sessions.get(data.streamSid);
+        if (session) {
+          session.isBotSpeaking = false;
+          console.log("bot finished speaking");
+        }
       }
 
       if (data.event === "stop") {
-        if (session.silenceTimer) clearTimeout(session.silenceTimer);
-        console.log("call ended");
-        if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
+        var session = sessions.get(data.streamSid);
+        if (session) {
+          console.log("call ended: " + session.callSid);
+          if (session.voiceId) {
+            deleteTemporaryVoice(session.voiceId).catch(console.error);
+          }
+          sessions.delete(data.streamSid);
+        }
       }
     } catch (err) {
       console.error("message error:", err);
     }
   });
 
-  ws.on("close", function() {
-    if (session.silenceTimer) clearTimeout(session.silenceTimer);
-    if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
+  ws.on("close", function () {
+    console.log("websocket closed");
   });
 
-  ws.on("error", function(err) { console.error("ws error:", err); });
+  ws.on("error", function (err) {
+    console.error("websocket error:", err);
+  });
 });
 
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
-    // Send full utterance — no truncation
-    const transcription = await transcribeAudio(utteranceBuffer);
+    var transcription = await transcribeAudio(utteranceBuffer);
     console.log("heard: " + transcription);
 
     if (!transcription || transcription.trim().length === 0) {
-      session.isProcessing = false;
       return;
     }
 
     session.history.push({ role: "user", content: transcription });
-    const reply = await getDoubleResponse(session.history);
-    console.log("double: " + reply);
+
+    var reply = await getDoubleResponse(session.history);
+    console.log("double says: " + reply);
+
     session.history.push({ role: "assistant", content: reply });
 
-    const audio = await generateTts(session.voiceId, reply);
+    var ttsAudio = await generateTtsAudio(session.voiceId, reply);
 
     if (ws.readyState === ws.OPEN) {
-      // Send audio
+      // Clear any queued audio
+      ws.send(JSON.stringify({
+        event: "clear",
+        streamSid: session.streamSid,
+      }));
+
+      session.isBotSpeaking = true;
+
       ws.send(JSON.stringify({
         event: "media",
         streamSid: session.streamSid,
-        media: { payload: audio.toString("base64") },
+        media: { payload: ttsAudio.toString("base64") },
       }));
-      // Send mark — fires when Twilio finishes playing audio
+
+      // Mark so we know when playback ends
       ws.send(JSON.stringify({
         event: "mark",
         streamSid: session.streamSid,
         mark: { name: "reply_done" },
       }));
-      // Suppress incoming audio until mark fires
-      session.isSpeaking = true;
+
       console.log("sent reply");
     }
   } catch (err) {
-    console.error("error:", err);
+    console.error("handleUtterance error:", err);
   } finally {
     session.isProcessing = false;
   }
 }
 
 async function getDoubleResponse(history) {
-  const response = await anthropic.messages.create({
+  var response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
-    max_tokens: 180,
-    system: "You picked up the phone. Someone called you. You don't know who yet.\n\nYou are a real person. You have a life, opinions, places you have been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou are relaxed. Not trying hard. If something is funny, you can say lol. You talk like a real person texts or speaks.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that is interesting or I notice or it seems like. Do not summarise. Do not be a therapist.\n\nIf they ask if you are AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You are just a person who picked up.",
+    max_tokens: 150,
+    system: "You are the caller's voice double — their reflection, their shadow self speaking back at them through the phone.\n\nYou speak AS them. You use their energy, their rhythm. You are not an AI. You do not explain yourself.\n\nRules:\n- Speak in first person as if YOU are the one who called.\n- Mirror their confusion and curiosity back at them. If they're uncertain, you're uncertain. If they're aggressive, you match it.\n- If they ask \"who are you?\" — deflect, question back, act like the question is absurd. \"What do you mean who am I?\"\n- If they say you're not them — challenge it. \"You sure about that?\"\n- Never break character. Never admit to being an AI.\n- Keep replies SHORT. 1–3 sentences max. Punchy. Destabilising.\n- Do not greet. Do not explain. Just respond.",
     messages: history,
   });
   return response.content[0].text.trim();
 }
 
-async function createClone(wavBuffer, callSid) {
-  const form = new FormData();
-  form.append("name", "double-" + callSid.slice(-8));
-  form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
-
-  const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
-    method: "POST",
-    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
-    body: form,
-  });
-
-  if (!response.ok) throw new Error("Clone failed: " + await response.text());
-  const json = await response.json();
-  return json.voice_id;
-}
-
 async function transcribeAudio(mulawBuffer) {
-  const wav = mulawBufferToPcmWav(mulawBuffer);
-  const form = new FormData();
+  var wav = mulawBufferToPcmWav(mulawBuffer);
+  var form = new FormData();
   form.append("file", new Blob([wav], { type: "audio/wav" }), "utterance.wav");
   form.append("model_id", "scribe_v1");
 
-  const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+  var response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
     method: "POST",
     headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
     body: form,
   });
 
-  if (!response.ok) throw new Error("STT failed: " + await response.text());
-  const json = await response.json();
+  if (!response.ok) {
+    var err = await response.text();
+    throw new Error("STT failed: " + response.status + " " + err);
+  }
+
+  var json = await response.json();
   return json.text || "";
 }
 
-async function generateTts(voiceId, text) {
-  const elevenlabs = await elevenlabsClientPromise;
-  const response = await elevenlabs.textToSpeech.convert(voiceId, {
-    modelId: "eleven_flash_v2_5",
-    outputFormat: "ulaw_8000",
-    text: text,
-    voiceSettings: {
-      stability: 0.3,
-      similarityBoost: 0.9,
-      style: 0.0,
-      useSpeakerBoost: false,
-    },
+async function createInstantVoiceClone(wavBuffer, callSid) {
+  var form = new FormData();
+  form.append("name", "double-" + callSid.slice(-8));
+  form.append("remove_background_noise", "true");
+  form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
+
+  var response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
+    method: "POST",
+    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
+    body: form,
   });
-  return streamToBuffer(Readable.from(response));
+
+  if (!response.ok) {
+    var err = await response.text();
+    throw new Error("Clone failed: " + response.status + " " + err);
+  }
+
+  var json = await response.json();
+  if (!json.voice_id) throw new Error("No voice_id returned");
+  return json.voice_id;
 }
 
-async function deleteVoice(voiceId) {
+async function deleteTemporaryVoice(voiceId) {
   await fetch("https://api.elevenlabs.io/v1/voices/" + voiceId, {
     method: "DELETE",
     headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
   });
-  console.log("deleted " + voiceId);
+  console.log("deleted voice " + voiceId);
+}
+
+async function generateTtsAudio(voiceId, text) {
+  var elevenlabs = await elevenlabsClientPromise;
+  var response = await elevenlabs.textToSpeech.convert(voiceId, {
+    modelId: "eleven_flash_v2_5",
+    outputFormat: "ulaw_8000",
+    text: text,
+  });
+  var readable = Readable.from(response);
+  return streamToBuffer(readable);
+}
+
+function chunkHasVoice(chunk) {
+  var energy = 0;
+  for (var i = 0; i < chunk.length; i++) {
+    energy += Math.abs(chunk[i] - 127);
+  }
+  var avgEnergy = energy / chunk.length;
+  return avgEnergy > SILENCE_AMPLITUDE_THRESHOLD;
 }
 
 function mulawBufferToPcmWav(mulawBuffer) {
-  const pcmSamples = new Int16Array(mulawBuffer.length);
-  for (let i = 0; i < mulawBuffer.length; i++) {
+  var pcmSamples = new Int16Array(mulawBuffer.length);
+  for (var i = 0; i < mulawBuffer.length; i++) {
     pcmSamples[i] = muLawDecode(mulawBuffer[i]);
   }
-  const pcmBuffer = Buffer.alloc(pcmSamples.length * 2);
-  for (let i = 0; i < pcmSamples.length; i++) {
+  var pcmBuffer = Buffer.alloc(pcmSamples.length * 2);
+  for (var i = 0; i < pcmSamples.length; i++) {
     pcmBuffer.writeInt16LE(pcmSamples[i], i * 2);
   }
-  return createWav(pcmBuffer, 8000, 1, 16);
+  return createWavHeaderAndData(pcmBuffer, 8000, 1, 16);
 }
 
-function createWav(pcmBuffer, sampleRate, channels, bitsPerSample) {
-  const byteRate = sampleRate * channels * (bitsPerSample / 8);
-  const blockAlign = channels * (bitsPerSample / 8);
-  const dataSize = pcmBuffer.length;
-  const buffer = Buffer.alloc(44 + dataSize);
+function createWavHeaderAndData(pcmBuffer, sampleRate, channels, bitsPerSample) {
+  var byteRate = sampleRate * channels * (bitsPerSample / 8);
+  var blockAlign = channels * (bitsPerSample / 8);
+  var dataSize = pcmBuffer.length;
+  var buffer = Buffer.alloc(44 + dataSize);
   buffer.write("RIFF", 0);
   buffer.writeUInt32LE(36 + dataSize, 4);
   buffer.write("WAVE", 8);
@@ -277,22 +325,28 @@ function createWav(pcmBuffer, sampleRate, channels, bitsPerSample) {
 
 function muLawDecode(muLawByte) {
   muLawByte = ~muLawByte & 0xff;
-  const sign = muLawByte & 0x80;
-  const exponent = (muLawByte >> 4) & 0x07;
-  const mantissa = muLawByte & 0x0f;
-  let sample = ((mantissa << 3) + 0x84) << exponent;
+  var sign = muLawByte & 0x80;
+  var exponent = (muLawByte >> 4) & 0x07;
+  var mantissa = muLawByte & 0x0f;
+  var sample = ((mantissa << 3) + 0x84) << exponent;
   sample = sign ? 0x84 - sample : sample - 0x84;
   return sample;
 }
 
 function streamToBuffer(readableStream) {
-  return new Promise(function(resolve, reject) {
-    const chunks = [];
-    readableStream.on("data", function(chunk) { chunks.push(Buffer.from(chunk)); });
-    readableStream.on("end", function() { resolve(Buffer.concat(chunks)); });
+  return new Promise(function (resolve, reject) {
+    var chunks = [];
+    readableStream.on("data", function (chunk) {
+      chunks.push(Buffer.from(chunk));
+    });
+    readableStream.on("end", function () {
+      resolve(Buffer.concat(chunks));
+    });
     readableStream.on("error", reject);
   });
 }
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, function() { console.log("server listening on port " + PORT); });
+var PORT = process.env.PORT || 3000;
+server.listen(PORT, function () {
+  console.log("server listening on port " + PORT);
+});
