@@ -20,8 +20,6 @@ app.use(express.urlencoded({ extended: false }));
 const CLONE_THRESHOLD_BYTES = 6 * 8000;
 const SILENCE_TIMEOUT_MS = 1200;
 
-const sessions = new Map();
-
 app.get("/", (req, res) => res.send("server running"));
 
 app.post("/voice", (req, res) => {
@@ -47,11 +45,34 @@ wss.on("connection", (ws) => {
     allBytes: 0,
     utteranceChunks: [],
     isProcessing: false,
+    isSpeaking: false,
     silenceTimer: null,
     voiceId: null,
     cloneReady: false,
     history: [],
   };
+
+  function tryProcessUtterance() {
+    if (session.isProcessing) return;
+    if (session.isSpeaking) return;
+    if (!session.voiceId) return;
+    if (session.utteranceChunks.length === 0) return;
+
+    session.isProcessing = true;
+    const snap = Buffer.concat(session.utteranceChunks);
+    session.utteranceChunks = [];
+
+    handleUtterance(session, snap, ws).catch(function (err) {
+      console.error("error:", err);
+    }).finally(function () {
+      session.isProcessing = false;
+      // If more audio arrived while we were processing, handle it
+      if (session.utteranceChunks.length > 0) {
+        if (session.silenceTimer) clearTimeout(session.silenceTimer);
+        session.silenceTimer = setTimeout(tryProcessUtterance, SILENCE_TIMEOUT_MS);
+      }
+    });
+  }
 
   ws.on("message", async (message) => {
     try {
@@ -66,6 +87,9 @@ wss.on("connection", (ws) => {
       if (data.event === "media") {
         if (!data.media || !data.media.payload) return;
 
+        // Ignore incoming audio while we are playing back a reply (echo suppression)
+        if (session.isSpeaking) return;
+
         const chunk = Buffer.from(data.media.payload, "base64");
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
@@ -75,23 +99,31 @@ wss.on("connection", (ws) => {
           session.cloneReady = true;
           console.log("cloning...");
           const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-          createClone(wav, session.callSid).then(function(voiceId) {
-            session.voiceId = voiceId;
-            console.log("clone ready");
-          }).catch(console.error);
+          createClone(wav, session.callSid)
+            .then(function (voiceId) {
+              session.voiceId = voiceId;
+              console.log("clone ready");
+              // Process any utterance that accumulated while cloning
+              if (session.utteranceChunks.length > 0 && !session.isProcessing) {
+                if (session.silenceTimer) clearTimeout(session.silenceTimer);
+                session.silenceTimer = setTimeout(tryProcessUtterance, SILENCE_TIMEOUT_MS);
+              }
+            })
+            .catch(console.error);
         }
 
         if (session.silenceTimer) clearTimeout(session.silenceTimer);
-        session.silenceTimer = setTimeout(async function() {
-          if (session.isProcessing || !session.voiceId || session.utteranceChunks.length === 0) return;
-          session.isProcessing = true;
-          const snap = Buffer.concat(session.utteranceChunks.splice(0));
-          session.utteranceChunks = [];
-          await handleUtterance(session, snap, ws).catch(function(err) {
-            console.error("error:", err);
-            session.isProcessing = false;
-          });
-        }, SILENCE_TIMEOUT_MS);
+        session.silenceTimer = setTimeout(tryProcessUtterance, SILENCE_TIMEOUT_MS);
+      }
+
+      // Mark event signals our outbound audio finished playing
+      if (data.event === "mark" && data.mark && data.mark.name === "reply_done") {
+        session.isSpeaking = false;
+        console.log("finished speaking");
+        // Process anything that arrived while we were speaking
+        if (session.utteranceChunks.length > 0 && !session.isProcessing) {
+          session.silenceTimer = setTimeout(tryProcessUtterance, SILENCE_TIMEOUT_MS);
+        }
       }
 
       if (data.event === "stop") {
@@ -104,22 +136,22 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", function() {
+  ws.on("close", function () {
     if (session.silenceTimer) clearTimeout(session.silenceTimer);
     if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
   });
 
-  ws.on("error", function(err) { console.error("ws error:", err); });
+  ws.on("error", function (err) {
+    console.error("ws error:", err);
+  });
 });
 
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
-    const recentBuffer = utteranceBuffer.slice(-3 * 8000);
-    const transcription = await transcribeAudio(recentBuffer);
+    const transcription = await transcribeAudio(utteranceBuffer);
     console.log("heard: " + transcription);
 
     if (!transcription || transcription.trim().length === 0) {
-      session.isProcessing = false;
       return;
     }
 
@@ -131,17 +163,37 @@ async function handleUtterance(session, utteranceBuffer, ws) {
     const audio = await generateTts(session.voiceId, reply);
 
     if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid: session.streamSid,
-        media: { payload: audio.toString("base64") },
-      }));
+      // Clear any queued outbound audio before sending new reply
+      ws.send(
+        JSON.stringify({
+          event: "clear",
+          streamSid: session.streamSid,
+        })
+      );
+
+      session.isSpeaking = true;
+
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          streamSid: session.streamSid,
+          media: { payload: audio.toString("base64") },
+        })
+      );
+
+      // Mark so we know when playback finishes
+      ws.send(
+        JSON.stringify({
+          event: "mark",
+          streamSid: session.streamSid,
+          mark: { name: "reply_done" },
+        })
+      );
+
       console.log("sent reply");
     }
   } catch (err) {
     console.error("error:", err);
-  } finally {
-    session.isProcessing = false;
   }
 }
 
@@ -149,7 +201,8 @@ async function getDoubleResponse(history) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: 180,
-    system: "You picked up the phone. Someone called you. You don't know who yet.\n\nYou are a real person. You have a life, opinions, places you have been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou are relaxed. Not trying hard. If something is funny, you can say lol. You talk like a real person texts or speaks.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that is interesting or I notice or it seems like. Do not summarise. Do not be a therapist.\n\nIf they ask if you are AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You are just a person who picked up.",
+    system:
+      "You picked up the phone. Someone called you. You don't know who yet.\n\nYou are a real person. You have a life, opinions, places you have been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou are relaxed. Not trying hard. If something is funny, you can say lol. You talk like a real person texts or speaks.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that is interesting or I notice or it seems like. Do not summarise. Do not be a therapist.\n\nIf they ask if you are AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You are just a person who picked up.",
     messages: history,
   });
   return response.content[0].text.trim();
@@ -158,7 +211,11 @@ async function getDoubleResponse(history) {
 async function createClone(wavBuffer, callSid) {
   const form = new FormData();
   form.append("name", "double-" + callSid.slice(-8));
-  form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
+  form.append(
+    "files",
+    new Blob([wavBuffer], { type: "audio/wav" }),
+    "sample.wav"
+  );
 
   const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
     method: "POST",
@@ -166,7 +223,7 @@ async function createClone(wavBuffer, callSid) {
     body: form,
   });
 
-  if (!response.ok) throw new Error("Clone failed: " + await response.text());
+  if (!response.ok) throw new Error("Clone failed: " + (await response.text()));
   const json = await response.json();
   return json.voice_id;
 }
@@ -183,7 +240,7 @@ async function transcribeAudio(mulawBuffer) {
     body: form,
   });
 
-  if (!response.ok) throw new Error("STT failed: " + await response.text());
+  if (!response.ok) throw new Error("STT failed: " + (await response.text()));
   const json = await response.json();
   return json.text || "";
 }
@@ -257,13 +314,19 @@ function muLawDecode(muLawByte) {
 }
 
 function streamToBuffer(readableStream) {
-  return new Promise(function(resolve, reject) {
+  return new Promise(function (resolve, reject) {
     const chunks = [];
-    readableStream.on("data", function(chunk) { chunks.push(Buffer.from(chunk)); });
-    readableStream.on("end", function() { resolve(Buffer.concat(chunks)); });
+    readableStream.on("data", function (chunk) {
+      chunks.push(Buffer.from(chunk));
+    });
+    readableStream.on("end", function () {
+      resolve(Buffer.concat(chunks));
+    });
     readableStream.on("error", reject);
   });
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, function() { console.log("server listening on port " + PORT); });
+server.listen(PORT, function () {
+  console.log("server listening on port " + PORT);
+});
