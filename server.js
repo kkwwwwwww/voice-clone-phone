@@ -18,7 +18,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 const MIN_CLONE_BYTES = 8000; // 1 second of audio minimum
-const PROCESS_INTERVAL_MS = 8000; // process every 8 seconds
+const PROCESS_INTERVAL_MS = 5000; // process every 8 seconds
 
 const sessions = new Map();
 
@@ -241,7 +241,7 @@ async function deleteTemporaryVoice(voiceId) {
 async function generateTtsAudio(voiceId, text) {
   const elevenlabs = await elevenlabsClientPromise;
   const response = await elevenlabs.textToSpeech.convert(voiceId, {
-    modelId: "eleven_flash_v2_5",
+    modelId: "eleven_multilingual_v2",
     outputFormat: "ulaw_8000",
     text,
   });
