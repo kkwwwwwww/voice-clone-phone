@@ -8,7 +8,7 @@ const twilio = require("twilio");
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const CLONE_THRESHOLD_BYTES = 10 * 8000;
+const CLONE_THRESHOLD_BYTES = 5 * 8000;
 
 const sessions = new Map();
 
