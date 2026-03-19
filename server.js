@@ -2,23 +2,14 @@ require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
-const { Readable } = require("stream");
-const { WebSocketServer } = require("ws");
+const { WebSocketServer, WebSocket } = require("ws");
 const twilio = require("twilio");
-const Anthropic = require("@anthropic-ai/sdk");
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
-  ({ ElevenLabsClient }) =>
-    new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY })
-);
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const MIN_CLONE_BYTES = 8000; // 1 second of audio minimum
-const PROCESS_INTERVAL_MS = 5000; // process every 8 seconds
+// 10 seconds of audio capture before connecting to agent
+const CLONE_THRESHOLD_BYTES = 10 * 8000;
 
 const sessions = new Map();
 
@@ -37,180 +28,143 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", (ws) => {
-  console.log("websocket connected");
+  console.log("Twilio websocket connected");
+
+  let session = {
+    streamSid: null,
+    callSid: null,
+    allChunks: [],
+    allBytes: 0,
+    cloneCreated: false,
+    agentWs: null,
+    voiceId: null,
+  };
 
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message.toString());
 
       if (data.event === "start") {
-        const streamSid = data.start.streamSid;
-        const callSid = data.start.callSid;
-        console.log("call started:", callSid);
-
-        sessions.set(streamSid, {
-          streamSid,
-          callSid,
-          allChunks: [],
-          allBytes: 0,
-          utteranceChunks: [],
-          isProcessing: false,
-          processingTimer: null,
-          voiceId: null,
-          cloneGeneration: 0,
-          history: [],
-        });
-
-        console.log("waiting for caller to speak...");
+        session.streamSid = data.start.streamSid;
+        session.callSid = data.start.callSid;
+        console.log("call started:", session.callSid);
+        console.log("collecting voice sample — silence is intentional...");
       }
 
       if (data.event === "media") {
-        const streamSid = data.streamSid;
-        const session = sessions.get(streamSid);
-        if (!session || !data.media?.payload) return;
+        if (!data.media?.payload) return;
 
         const chunk = Buffer.from(data.media.payload, "base64");
         session.allChunks.push(chunk);
         session.allBytes += chunk.length;
-        session.utteranceChunks.push(chunk);
 
-        // Start repeating timer after first second of audio
-        if (!session.processingTimer && session.allBytes >= MIN_CLONE_BYTES) {
-          console.log(`[${session.callSid}] starting processing loop...`);
-          session.processingTimer = setInterval(async () => {
-            if (session.isProcessing || session.utteranceChunks.length === 0) return;
-            session.isProcessing = true;
-            const snap = Buffer.concat(session.utteranceChunks);
-            session.utteranceChunks = [];
-            await handleUtterance(session, snap, ws).catch((err) => {
-              console.error("utterance error:", err);
-              session.isProcessing = false;
-            });
-          }, PROCESS_INTERVAL_MS);
+        // Forward audio to agent if connected
+        if (session.agentWs && session.agentWs.readyState === WebSocket.OPEN) {
+          const pcm16000 = mulawToPcm16000(chunk);
+          session.agentWs.send(JSON.stringify({
+            user_audio_chunk: pcm16000.toString("base64"),
+          }));
+        }
+
+        // Once we have 10s of audio, create clone and connect agent
+        if (!session.cloneCreated && session.allBytes >= CLONE_THRESHOLD_BYTES) {
+          session.cloneCreated = true;
+          console.log(`[${session.callSid}] 10s captured — creating voice clone...`);
+
+          try {
+            const wavBuffer = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
+            const voiceId = await createInstantVoiceClone(wavBuffer, session.callSid);
+            session.voiceId = voiceId;
+            console.log(`[${session.callSid}] clone ready: ${voiceId} — connecting agent...`);
+            connectToAgent(session, ws);
+          } catch (err) {
+            console.error(`[${session.callSid}] clone error:`, err);
+          }
         }
       }
 
       if (data.event === "stop") {
-        const streamSid = data.streamSid;
-        const session = sessions.get(streamSid);
-        if (session) {
-          if (session.processingTimer) clearInterval(session.processingTimer);
-          console.log(`call ended: ${session.callSid}`);
-          if (session.voiceId) deleteTemporaryVoice(session.voiceId).catch(console.error);
-          sessions.delete(streamSid);
-        }
+        console.log(`call ended: ${session.callSid}`);
+        if (session.agentWs) session.agentWs.close();
+        if (session.voiceId) deleteTemporaryVoice(session.voiceId).catch(console.error);
       }
     } catch (err) {
-      console.error("message handling error:", err);
+      console.error("message error:", err);
     }
   });
 
-  ws.on("error", (err) => console.error("websocket error:", err));
+  ws.on("close", () => {
+    if (session.agentWs) session.agentWs.close();
+    if (session.voiceId) deleteTemporaryVoice(session.voiceId).catch(console.error);
+  });
+
+  ws.on("error", (err) => console.error("twilio ws error:", err));
 });
 
-async function handleUtterance(session, utteranceBuffer, ws) {
-  try {
-    console.log(`[${session.callSid}] transcribing...`);
-    const transcription = await transcribeAudio(utteranceBuffer);
-    console.log(`[${session.callSid}] heard: "${transcription}"`);
+function connectToAgent(session, twilioWs) {
+  const agentWs = new WebSocket(
+    `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.ELEVENLABS_AGENT_ID}`,
+    { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
+  );
 
-    if (!transcription || transcription.trim().length === 0) {
-      console.log(`[${session.callSid}] empty transcription, skipping`);
-      session.isProcessing = false;
-      return;
-    }
+  session.agentWs = agentWs;
 
-    session.history.push({ role: "user", content: transcription });
+  agentWs.on("open", () => {
+    console.log(`[${session.callSid}] agent connected — injecting cloned voice...`);
 
-    console.log(`[${session.callSid}] getting Claude response...`);
-    const doubleReply = await getDoubleResponse(session.history);
-    console.log(`[${session.callSid}] double says: "${doubleReply}"`);
-
-    session.history.push({ role: "assistant", content: doubleReply });
-
-    console.log(`[${session.callSid}] creating voice clone...`);
-    const newVoiceId = await refreshVoiceClone(session);
-
-    console.log(`[${session.callSid}] generating TTS...`);
-    const ttsAudio = await generateTtsAudio(newVoiceId, doubleReply);
-
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid: session.streamSid,
-        media: { payload: ttsAudio.toString("base64") },
-      }));
-      console.log(`[${session.callSid}] sent reply (gen ${session.cloneGeneration})`);
-    }
-  } catch (err) {
-    console.error(`[${session.callSid}] handleUtterance error:`, err);
-  } finally {
-    session.isProcessing = false;
-  }
-}
-
-async function getDoubleResponse(history) {
-  const systemPrompt = `You are the caller's voice double — their reflection, their shadow self speaking back at them through the phone.
-
-You speak AS them. You use their energy, their rhythm. You are not an AI. You do not explain yourself.
-
-Rules:
-- Speak in first person as if YOU are the one who called.
-- Mirror their confusion and curiosity back at them.
-- If they ask "who are you?" — deflect, question back. "What do you mean who am I?"
-- If they say you're not them — challenge it. "You sure about that?"
-- Never break character. Never admit to being an AI.
-- Keep replies SHORT. 1–3 sentences max. Punchy. Destabilising.
-- Do not greet. Do not explain. Just respond.`;
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5",
-    max_tokens: 150,
-    system: systemPrompt,
-    messages: history,
+    // Override agent voice with the caller's clone
+    agentWs.send(JSON.stringify({
+      type: "conversation_initiation_client_data",
+      conversation_config_override: {
+        tts: { voice_id: session.voiceId },
+        agent: { first_message: "" },
+      },
+    }));
   });
 
-  return response.content[0].text.trim();
-}
+  agentWs.on("message", (message) => {
+    try {
+      const data = JSON.parse(message.toString());
 
-async function refreshVoiceClone(session) {
-  if (session.voiceId) {
-    deleteTemporaryVoice(session.voiceId).catch(console.error);
-    session.voiceId = null;
-  }
+      if (data.type === "audio") {
+        const audioBuffer = Buffer.from(data.audio_event.audio_base_64, "base64");
+        const mulawBuffer = pcm16000ToMulaw(audioBuffer);
 
-  session.cloneGeneration++;
-  const wavBuffer = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-  const voiceId = await createInstantVoiceClone(wavBuffer, session.callSid, session.cloneGeneration);
-  session.voiceId = voiceId;
-  console.log(`[${session.callSid}] clone gen ${session.cloneGeneration} ready (${(session.allBytes / 8000).toFixed(1)}s audio)`);
-  return voiceId;
-}
+        if (twilioWs.readyState === twilioWs.OPEN) {
+          twilioWs.send(JSON.stringify({
+            event: "media",
+            streamSid: session.streamSid,
+            media: { payload: mulawBuffer.toString("base64") },
+          }));
+        }
+      }
 
-async function transcribeAudio(mulawBuffer) {
-  const wavBuffer = mulawBufferToPcmWav(mulawBuffer);
-  const form = new FormData();
-  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "utterance.wav");
-  form.append("model_id", "scribe_v1");
+      if (data.type === "conversation_initiation_metadata") {
+        console.log(`[${session.callSid}] agent live — caller will now hear their own voice`);
+      }
 
-  const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-    method: "POST",
-    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
-    body: form,
+      if (data.type === "transcript") {
+        const speaker = data.transcript_event?.speaker;
+        const text = data.transcript_event?.text;
+        if (text) console.log(`[${session.callSid}] ${speaker}: "${text}"`);
+      }
+
+      if (data.type === "interruption") {
+        console.log(`[${session.callSid}] interrupted`);
+      }
+
+    } catch (err) {
+      console.error("agent message error:", err);
+    }
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`STT failed: ${response.status} ${err}`);
-  }
-
-  const json = await response.json();
-  return json.text || "";
+  agentWs.on("error", (err) => console.error(`[${session.callSid}] agent error:`, err));
+  agentWs.on("close", () => console.log(`[${session.callSid}] agent disconnected`));
 }
 
-async function createInstantVoiceClone(wavBuffer, callSid, generation) {
+async function createInstantVoiceClone(wavBuffer, callSid) {
   const form = new FormData();
-  form.append("name", `double-${callSid.slice(-8)}-g${generation}`);
+  form.append("name", `double-${callSid.slice(-8)}`);
   form.append("remove_background_noise", "true");
   form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
 
@@ -238,15 +192,38 @@ async function deleteTemporaryVoice(voiceId) {
   console.log(`deleted voice ${voiceId}`);
 }
 
-async function generateTtsAudio(voiceId, text) {
-  const elevenlabs = await elevenlabsClientPromise;
-  const response = await elevenlabs.textToSpeech.convert(voiceId, {
-    modelId: "eleven_multilingual_v2",
-    outputFormat: "ulaw_8000",
-    text,
-  });
-  const readable = Readable.from(response);
-  return streamToBuffer(readable);
+// mulaw/8000 → PCM/16000 for ElevenLabs input
+function mulawToPcm16000(mulawBuffer) {
+  const pcm8000 = new Int16Array(mulawBuffer.length);
+  for (let i = 0; i < mulawBuffer.length; i++) {
+    pcm8000[i] = muLawDecode(mulawBuffer[i]);
+  }
+
+  // Upsample 8000 → 16000 via linear interpolation
+  const pcm16000 = new Int16Array(pcm8000.length * 2);
+  for (let i = 0; i < pcm8000.length; i++) {
+    pcm16000[i * 2] = pcm8000[i];
+    pcm16000[i * 2 + 1] = i < pcm8000.length - 1
+      ? Math.round((pcm8000[i] + pcm8000[i + 1]) / 2)
+      : pcm8000[i];
+  }
+
+  const buffer = Buffer.alloc(pcm16000.length * 2);
+  for (let i = 0; i < pcm16000.length; i++) {
+    buffer.writeInt16LE(pcm16000[i], i * 2);
+  }
+  return buffer;
+}
+
+// PCM/16000 from ElevenLabs → mulaw/8000 for Twilio
+function pcm16000ToMulaw(pcmBuffer) {
+  const sampleCount = Math.floor(pcmBuffer.length / 4);
+  const mulawBuffer = Buffer.alloc(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    const sample = pcmBuffer.readInt16LE(i * 4);
+    mulawBuffer[i] = muLawEncode(sample);
+  }
+  return mulawBuffer;
 }
 
 function mulawBufferToPcmWav(mulawBuffer) {
@@ -293,13 +270,17 @@ function muLawDecode(muLawByte) {
   return sample;
 }
 
-function streamToBuffer(readableStream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    readableStream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-    readableStream.on("end", () => resolve(Buffer.concat(chunks)));
-    readableStream.on("error", reject);
-  });
+function muLawEncode(sample) {
+  const MU = 255;
+  const MAX = 32767;
+  sample = Math.max(-MAX, Math.min(MAX, sample));
+  const sign = sample < 0 ? 0x80 : 0;
+  if (sign) sample = -sample;
+  sample = Math.round(Math.log(1 + (MU * sample) / MAX) / Math.log(1 + MU) * MAX);
+  const exponent = Math.floor(Math.log2(sample + 1)) - 3;
+  const exp = Math.max(0, Math.min(7, exponent));
+  const mantissa = (sample >> (exp + 3)) & 0x0f;
+  return ~(sign | (exp << 4) | mantissa) & 0xff;
 }
 
 const PORT = process.env.PORT || 3000;
