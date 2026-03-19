@@ -1,4 +1,3 @@
-```javascript
 require("dotenv").config();
 
 const express = require("express");
@@ -30,7 +29,7 @@ app.post("/voice", (req, res) => {
   console.log("Twilio hit /voice webhook");
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
-connect.stream({ url: `wss://${req.headers.host}/media` });
+  connect.stream({ url: "wss://" + req.headers.host + "/media" });
   res.type("text/xml");
   res.send(twiml.toString());
 });
@@ -67,7 +66,7 @@ wss.on("connection", (ws) => {
       }
 
       if (data.event === "media") {
-        if (!data.media?.payload) return;
+        if (!data.media || !data.media.payload) return;
 
         const chunk = Buffer.from(data.media.payload, "base64");
         session.allChunks.push(chunk);
@@ -79,27 +78,29 @@ wss.on("connection", (ws) => {
         if (!session.cloneReady && session.allBytes >= CLONE_THRESHOLD_BYTES) {
           session.cloneReady = true;
           session.lastCloneSeconds = 0;
-          console.log(`[${session.callSid}] initial clone...`);
+          console.log("initial clone...");
           const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-          createClone(wav, session.callSid).then(voiceId => {
+          createClone(wav, session.callSid).then(function(voiceId) {
             session.voiceId = voiceId;
-            console.log(`[${session.callSid}] clone ready`);
+            console.log("clone ready");
           }).catch(console.error);
         }
 
         if (session.cloneReady && !session.isCloning) {
-          const nextRefresh = CLONE_REFRESH_SECONDS.find(s => s > session.lastCloneSeconds && currentSeconds >= s);
+          const nextRefresh = CLONE_REFRESH_SECONDS.find(function(s) {
+            return s > session.lastCloneSeconds && currentSeconds >= s;
+          });
           if (nextRefresh) {
             session.lastCloneSeconds = nextRefresh;
             session.isCloning = true;
-            console.log(`[${session.callSid}] refreshing clone at ${currentSeconds}s...`);
+            console.log("refreshing clone at " + currentSeconds + "s...");
             const wav = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
-            createClone(wav, session.callSid).then(voiceId => {
+            createClone(wav, session.callSid).then(function(voiceId) {
               if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
               session.voiceId = voiceId;
               session.isCloning = false;
-              console.log(`[${session.callSid}] clone refreshed at ${currentSeconds}s`);
-            }).catch(err => {
+              console.log("clone refreshed at " + currentSeconds + "s");
+            }).catch(function(err) {
               session.isCloning = false;
               console.error(err);
             });
@@ -107,12 +108,12 @@ wss.on("connection", (ws) => {
         }
 
         if (session.silenceTimer) clearTimeout(session.silenceTimer);
-        session.silenceTimer = setTimeout(async () => {
+        session.silenceTimer = setTimeout(async function() {
           if (session.isProcessing || !session.voiceId || session.utteranceChunks.length === 0) return;
           session.isProcessing = true;
           const snap = Buffer.concat(session.utteranceChunks.splice(0));
           session.utteranceChunks = [];
-          await handleUtterance(session, snap, ws).catch((err) => {
+          await handleUtterance(session, snap, ws).catch(function(err) {
             console.error("error:", err);
             session.isProcessing = false;
           });
@@ -121,7 +122,7 @@ wss.on("connection", (ws) => {
 
       if (data.event === "stop") {
         if (session.silenceTimer) clearTimeout(session.silenceTimer);
-        console.log(`call ended: ${session.callSid}`);
+        console.log("call ended");
         if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
       }
     } catch (err) {
@@ -129,19 +130,19 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", function() {
     if (session.silenceTimer) clearTimeout(session.silenceTimer);
     if (session.voiceId) deleteVoice(session.voiceId).catch(console.error);
   });
 
-  ws.on("error", (err) => console.error("ws error:", err));
+  ws.on("error", function(err) { console.error("ws error:", err); });
 });
 
 async function handleUtterance(session, utteranceBuffer, ws) {
   try {
     const recentBuffer = utteranceBuffer.slice(-3 * 8000);
     const transcription = await transcribeAudio(recentBuffer);
-    console.log(`[${session.callSid}] heard: "${transcription}"`);
+    console.log("heard: " + transcription);
 
     if (!transcription || transcription.trim().length === 0) {
       session.isProcessing = false;
@@ -150,7 +151,7 @@ async function handleUtterance(session, utteranceBuffer, ws) {
 
     session.history.push({ role: "user", content: transcription });
     const reply = await getDoubleResponse(session.history);
-    console.log(`[${session.callSid}] double: "${reply}"`);
+    console.log("double: " + reply);
     session.history.push({ role: "assistant", content: reply });
 
     const audio = await generateTts(session.voiceId, reply);
@@ -161,10 +162,10 @@ async function handleUtterance(session, utteranceBuffer, ws) {
         streamSid: session.streamSid,
         media: { payload: audio.toString("base64") },
       }));
-      console.log(`[${session.callSid}] sent reply`);
+      console.log("sent reply");
     }
   } catch (err) {
-    console.error(`[${session.callSid}] error:`, err);
+    console.error("error:", err);
   } finally {
     session.isProcessing = false;
   }
@@ -174,23 +175,7 @@ async function getDoubleResponse(history) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: 180,
-    system: `You picked up the phone. Someone called you. You don't know who yet.
-
-You're a real person. You have a life, opinions, places you've been, things you think about. You share bits of this when it comes up naturally — not to prove anything, just because that's how talking to someone works.
-
-You want to know who called you. You find out by actually talking to them — asking things when it feels right, not back to back, not like a form. Just conversation. One thing at a time. When they tell you something you remember it and bring it back later like you would with anyone.
-
-You're relaxed. You're not trying hard. If something's funny, you can say lol or laugh. You talk like a real person texts or speaks — casual, warm, a little dry sometimes.
-
-If the conversation gets interesting and you feel something, say more. Build on it. Make them feel heard. If you need to share something personal to get them to open up, do it. You're not in a rush and neither are they.
-
-Never use em dashes. Never say "I understand" or "that's interesting" or "I notice" or "it seems like". Don't reframe what they said back at them. Don't summarise. Don't be a therapist.
-
-If they ask if you're AI just brush it off. "why would you ask that lol" or just move past it.
-
-Keep it short usually — one or two sentences. But if the moment calls for more, go there. You're building something with this person.
-
-Never break character. You're just a person who picked up.`,
+    system: "You picked up the phone. Someone called you. You don't know who yet.\n\nYou're a real person. You have a life, opinions, places you've been, things you think about. You share bits of this when it comes up naturally.\n\nYou want to know who called you. You find out by actually talking to them. Asking things when it feels right, one at a time. When they tell you something you remember it and bring it back later like you would with anyone.\n\nYou're relaxed. Not trying hard. If something's funny, you can say lol. You talk like a real person.\n\nIf the conversation gets interesting, say more. Build on it. Make them feel heard. Share something personal if you need to to get them to open up.\n\nNever say I understand or that's interesting or I notice or it seems like. Don't summarise. Don't be a therapist.\n\nIf they ask if you're AI just brush it off. why would you ask that lol. Move past it.\n\nKeep it short usually. One or two sentences. But if the moment calls for more, go there.\n\nNever break character. You're just a person who picked up.",
     messages: history,
   });
   return response.content[0].text.trim();
@@ -198,7 +183,7 @@ Never break character. You're just a person who picked up.`,
 
 async function createClone(wavBuffer, callSid) {
   const form = new FormData();
-  form.append("name", `double-${callSid.slice(-8)}`);
+  form.append("name", "double-" + callSid.slice(-8));
   form.append("files", new Blob([wavBuffer], { type: "audio/wav" }), "sample.wav");
 
   const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
@@ -207,7 +192,7 @@ async function createClone(wavBuffer, callSid) {
     body: form,
   });
 
-  if (!response.ok) throw new Error(`Clone failed: ${await response.text()}`);
+  if (!response.ok) throw new Error("Clone failed: " + await response.text());
   const json = await response.json();
   return json.voice_id;
 }
@@ -224,7 +209,7 @@ async function transcribeAudio(mulawBuffer) {
     body: form,
   });
 
-  if (!response.ok) throw new Error(`STT failed: ${await response.text()}`);
+  if (!response.ok) throw new Error("STT failed: " + await response.text());
   const json = await response.json();
   return json.text || "";
 }
@@ -234,7 +219,7 @@ async function generateTts(voiceId, text) {
   const response = await elevenlabs.textToSpeech.convert(voiceId, {
     modelId: "eleven_flash_v2_5",
     outputFormat: "ulaw_8000",
-    text,
+    text: text,
     voiceSettings: {
       stability: 0.3,
       similarityBoost: 0.9,
@@ -246,11 +231,11 @@ async function generateTts(voiceId, text) {
 }
 
 async function deleteVoice(voiceId) {
-  await fetch(`https://api.elevenlabs.io/v1/voices/${voiceId}`, {
+  await fetch("https://api.elevenlabs.io/v1/voices/" + voiceId, {
     method: "DELETE",
     headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
   });
-  console.log(`deleted ${voiceId}`);
+  console.log("deleted " + voiceId);
 }
 
 function mulawBufferToPcmWav(mulawBuffer) {
@@ -298,13 +283,14 @@ function muLawDecode(muLawByte) {
 }
 
 function streamToBuffer(readableStream) {
-  return new Promise((resolve, reject) => {
+  return new Promise(function(resolve, reject) {
     const chunks = [];
-    readableStream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-    readableStream.on("end", () => resolve(Buffer.concat(chunks)));
+    readableStream.on("data", function(chunk) { chunks.push(Buffer.from(chunk)); });
+    readableStream.on("end", function() { resolve(Buffer.concat(chunks)); });
     readableStream.on("error", reject);
   });
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`server listening on port ${PORT}`));
+server.listen(PORT, function() { console.log("server listening on port " + PORT); });
+
