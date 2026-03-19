@@ -6,22 +6,18 @@ const { WebSocketServer, WebSocket } = require("ws");
 const twilio = require("twilio");
 const Anthropic = require("@anthropic-ai/sdk");
 
-// ─── Clients ────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ─── Config ─────────────────────────────────────────────────────────
-const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"; // Rachel - fallback voice
+const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM";
 
-// ─── Lazy-load ElevenLabs (ESM module) ──────────────────────────────
 const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
   ({ ElevenLabsClient }) =>
     new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY })
 );
 
-// ─── Express routes ─────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("server running"));
 
 app.post("/voice", (req, res) => {
@@ -36,7 +32,6 @@ app.post("/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
-// ─── WebSocket handler (one per call) ───────────────────────────────
 wss.on("connection", (ws) => {
   console.log("[twilio] WebSocket connected");
 
@@ -48,9 +43,11 @@ wss.on("connection", (ws) => {
     deepgramWs: null,
     pendingTranscript: "",
     history: [],
+    ttsQueue: [],
+    ttsPlaying: false,
   };
 
-  // ─── Start Deepgram live STT ────────────────────────────────────
+  // ─── Deepgram live STT ────────────────────────────────────────
   function startDeepgram() {
     const dgUrl =
       "wss://api.deepgram.com/v1/listen?" +
@@ -88,9 +85,7 @@ wss.on("connection", (ws) => {
             console.log("[deepgram] Final: " + transcript);
           }
         }
-      } catch (e) {
-        // ignore parse errors
-      }
+      } catch (e) {}
     });
 
     session.deepgramWs.on("error", (err) => {
@@ -104,7 +99,7 @@ wss.on("connection", (ws) => {
 
   startDeepgram();
 
-  // ─── Process an utterance (the fast path) ─────────────────────────
+  // ─── Process utterance ────────────────────────────────────────
   async function processUtterance(text) {
     if (!text || session.isProcessing) return;
     session.isProcessing = true;
@@ -127,37 +122,28 @@ wss.on("connection", (ws) => {
       });
 
       let fullResponse = "";
-      let sentenceBuffer = "";
       let firstChunkTime = null;
       const startTime = Date.now();
 
+      // Collect the FULL response, then send to TTS as one piece
+      // This avoids sentence-splitting bugs and overlapping audio
       stream.on("text", (text) => {
         if (!firstChunkTime) {
           firstChunkTime = Date.now();
           console.log("[claude] First token: " + (firstChunkTime - startTime) + "ms");
         }
-
         fullResponse += text;
-        sentenceBuffer += text;
-
-        const sentenceEnd = sentenceBuffer.match(/[.!?]\s|[.!?]$/);
-        if (sentenceEnd) {
-          const sentence = sentenceBuffer.trim();
-          sentenceBuffer = "";
-          if (sentence) {
-            streamTTSToTwilio(sentence);
-          }
-        }
       });
 
       await stream.finalMessage();
 
-      if (sentenceBuffer.trim()) {
-        streamTTSToTwilio(sentenceBuffer.trim());
-      }
-
-      session.history.push({ role: "assistant", content: fullResponse });
       console.log("[claude] Full response: " + fullResponse);
+
+      if (fullResponse.trim()) {
+        session.history.push({ role: "assistant", content: fullResponse });
+        // Send entire response as one TTS request — clean audio, no overlap
+        queueTTS(fullResponse.trim());
+      }
 
       if (session.history.length > 20) {
         session.history = session.history.slice(-20);
@@ -169,8 +155,23 @@ wss.on("connection", (ws) => {
     }
   }
 
-  // ─── Stream TTS audio directly to Twilio ──────────────────────────
-  async function streamTTSToTwilio(text) {
+  // ─── TTS queue — one at a time, no overlap ────────────────────
+  function queueTTS(text) {
+    session.ttsQueue.push(text);
+    if (!session.ttsPlaying) {
+      playNextTTS();
+    }
+  }
+
+  async function playNextTTS() {
+    if (session.ttsQueue.length === 0) {
+      session.ttsPlaying = false;
+      return;
+    }
+
+    session.ttsPlaying = true;
+    const text = session.ttsQueue.shift();
+
     try {
       const elevenlabs = await elevenlabsClientPromise;
       const startTime = Date.now();
@@ -188,7 +189,7 @@ wss.on("connection", (ws) => {
         }
       );
 
-      console.log("[tts] Streaming audio for: " + text.substring(0, 40) + "...");
+      console.log("[tts] Playing: " + text.substring(0, 50) + "...");
       let firstChunk = true;
 
       for await (const chunk of audioStream) {
@@ -209,12 +210,17 @@ wss.on("connection", (ws) => {
           );
         }
       }
+
+      console.log("[tts] Done playing");
     } catch (err) {
       console.error("[tts] Error:", err.message);
     }
+
+    // Play next in queue
+    playNextTTS();
   }
 
-  // ─── Handle Twilio WebSocket messages ─────────────────────────────
+  // ─── Twilio WebSocket messages ────────────────────────────────
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message.toString());
@@ -228,7 +234,6 @@ wss.on("connection", (ws) => {
 
         case "media": {
           const audio = Buffer.from(data.media.payload, "base64");
-
           if (
             session.deepgramWs &&
             session.deepgramWs.readyState === WebSocket.OPEN
@@ -260,7 +265,6 @@ wss.on("connection", (ws) => {
   }
 });
 
-// ─── Start server ───────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log("Server listening on port " + PORT);
