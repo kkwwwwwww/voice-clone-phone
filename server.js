@@ -8,7 +8,6 @@ const twilio = require("twilio");
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// 10 seconds of audio capture before connecting to agent
 const CLONE_THRESHOLD_BYTES = 10 * 8000;
 
 const sessions = new Map();
@@ -48,7 +47,7 @@ wss.on("connection", (ws) => {
         session.streamSid = data.start.streamSid;
         session.callSid = data.start.callSid;
         console.log("call started:", session.callSid);
-        console.log("collecting voice sample — silence is intentional...");
+        console.log("collecting voice sample...");
       }
 
       if (data.event === "media") {
@@ -60,25 +59,30 @@ wss.on("connection", (ws) => {
 
         // Forward audio to agent if connected
         if (session.agentWs && session.agentWs.readyState === WebSocket.OPEN) {
-          const pcm16000 = mulawToPcm16000(chunk);
           session.agentWs.send(JSON.stringify({
-            user_audio_chunk: pcm16000.toString("base64"),
+            user_audio_chunk: chunk.toString("base64"),
           }));
         }
 
-        // Once we have 10s of audio, create clone and connect agent
+        // Once we have 10s, clone and connect
         if (!session.cloneCreated && session.allBytes >= CLONE_THRESHOLD_BYTES) {
           session.cloneCreated = true;
-          console.log(`[${session.callSid}] 10s captured — creating voice clone...`);
+          console.log(`[${session.callSid}] 10s captured — cloning voice...`);
 
           try {
             const wavBuffer = mulawBufferToPcmWav(Buffer.concat(session.allChunks));
             const voiceId = await createInstantVoiceClone(wavBuffer, session.callSid);
             session.voiceId = voiceId;
-            console.log(`[${session.callSid}] clone ready: ${voiceId} — connecting agent...`);
+            console.log(`[${session.callSid}] clone ready: ${voiceId}`);
+
+            await updateAgentVoice(voiceId);
+            console.log(`[${session.callSid}] agent voice updated — connecting...`);
+
             connectToAgent(session, ws);
           } catch (err) {
-            console.error(`[${session.callSid}] clone error:`, err);
+            console.error(`[${session.callSid}] error:`, err);
+            console.log(`[${session.callSid}] falling back to default voice...`);
+            connectToAgent(session, ws);
           }
         }
       }
@@ -101,6 +105,31 @@ wss.on("connection", (ws) => {
   ws.on("error", (err) => console.error("twilio ws error:", err));
 });
 
+async function updateAgentVoice(voiceId) {
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/convai/agents/${process.env.ELEVENLABS_AGENT_ID}`,
+    {
+      method: "PATCH",
+      headers: {
+        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        conversation_config: {
+          tts: { voice_id: voiceId },
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Agent voice update failed: ${response.status} ${err}`);
+  }
+
+  console.log("agent voice updated successfully");
+}
+
 function connectToAgent(session, twilioWs) {
   const agentWs = new WebSocket(
     `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.ELEVENLABS_AGENT_ID}`,
@@ -110,9 +139,7 @@ function connectToAgent(session, twilioWs) {
   session.agentWs = agentWs;
 
   agentWs.on("open", () => {
-    console.log(`[${session.callSid}] agent connected — injecting cloned voice...`);
-
-    // Override agent voice with the caller's clone
+    console.log(`[${session.callSid}] agent connected`);
     agentWs.send(JSON.stringify({
       type: "conversation_initiation_client_data",
       conversation_config_override: {
@@ -127,19 +154,18 @@ function connectToAgent(session, twilioWs) {
 
       if (data.type === "audio") {
         const audioBuffer = Buffer.from(data.audio_event.audio_base_64, "base64");
-        const mulawBuffer = pcm16000ToMulaw(audioBuffer);
 
         if (twilioWs.readyState === twilioWs.OPEN) {
           twilioWs.send(JSON.stringify({
             event: "media",
             streamSid: session.streamSid,
-            media: { payload: mulawBuffer.toString("base64") },
+            media: { payload: audioBuffer.toString("base64") },
           }));
         }
       }
 
       if (data.type === "conversation_initiation_metadata") {
-        console.log(`[${session.callSid}] agent live — caller will now hear their own voice`);
+        console.log(`[${session.callSid}] agent live`);
       }
 
       if (data.type === "transcript") {
@@ -148,16 +174,12 @@ function connectToAgent(session, twilioWs) {
         if (text) console.log(`[${session.callSid}] ${speaker}: "${text}"`);
       }
 
-      if (data.type === "interruption") {
-        console.log(`[${session.callSid}] interrupted`);
-      }
-
     } catch (err) {
       console.error("agent message error:", err);
     }
   });
 
-  agentWs.on("error", (err) => console.error(`[${session.callSid}] agent error:`, err));
+  agentWs.on("error", (err) => console.error(`agent error:`, err));
   agentWs.on("close", () => console.log(`[${session.callSid}] agent disconnected`));
 }
 
@@ -189,42 +211,6 @@ async function deleteTemporaryVoice(voiceId) {
     headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
   });
   console.log(`deleted voice ${voiceId}`);
-}
-
-// mulaw/8000 → PCM/16000 for ElevenLabs input
-function mulawToPcm16000(mulawBuffer) {
-  const pcm8000 = new Int16Array(mulawBuffer.length);
-  for (let i = 0; i < mulawBuffer.length; i++) {
-    pcm8000[i] = muLawDecode(mulawBuffer[i]);
-  }
-
-  // Upsample 8000 → 16000 via linear interpolation
-  const pcm16000 = new Int16Array(pcm8000.length * 2);
-  for (let i = 0; i < pcm8000.length; i++) {
-    pcm16000[i * 2] = pcm8000[i];
-    pcm16000[i * 2 + 1] = i < pcm8000.length - 1
-      ? Math.round((pcm8000[i] + pcm8000[i + 1]) / 2)
-      : pcm8000[i];
-  }
-
-  const buffer = Buffer.alloc(pcm16000.length * 2);
-  for (let i = 0; i < pcm16000.length; i++) {
-    buffer.writeInt16LE(pcm16000[i], i * 2);
-  }
-  return buffer;
-}
-
-function pcm16000ToMulaw(pcmBuffer) {
-  // ElevenLabs sends 16-bit PCM at 16000Hz
-  // Downsample to 8000Hz and encode as mulaw for Twilio
-  const sampleCount = Math.floor(pcmBuffer.length / 2);
-  const downsampled = Math.floor(sampleCount / 2);
-  const mulawBuffer = Buffer.alloc(downsampled);
-  for (let i = 0; i < downsampled; i++) {
-    const sample = pcmBuffer.readInt16LE(i * 4);
-    mulawBuffer[i] = muLawEncode(sample);
-  }
-  return mulawBuffer;
 }
 
 function mulawBufferToPcmWav(mulawBuffer) {
@@ -269,19 +255,6 @@ function muLawDecode(muLawByte) {
   let sample = ((mantissa << 3) + 0x84) << exponent;
   sample = sign ? 0x84 - sample : sample - 0x84;
   return sample;
-}
-
-function muLawEncode(sample) {
-  const MU = 255;
-  const MAX = 32767;
-  sample = Math.max(-MAX, Math.min(MAX, sample));
-  const sign = sample < 0 ? 0x80 : 0;
-  if (sign) sample = -sample;
-  sample = Math.round(Math.log(1 + (MU * sample) / MAX) / Math.log(1 + MU) * MAX);
-  const exponent = Math.floor(Math.log2(sample + 1)) - 3;
-  const exp = Math.max(0, Math.min(7, exponent));
-  const mantissa = (sample >> (exp + 3)) & 0x0f;
-  return ~(sign | (exp << 4) | mantissa) & 0xff;
 }
 
 const PORT = process.env.PORT || 3000;
