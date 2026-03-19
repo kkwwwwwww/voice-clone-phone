@@ -116,7 +116,6 @@ function connectToAgent(session, twilioWs) {
     agentWs.send(JSON.stringify({
       type: "conversation_initiation_client_data",
       conversation_config_override: {
-        tts: { voice_id: session.voiceId },
         agent: { first_message: "" },
       },
     }));
