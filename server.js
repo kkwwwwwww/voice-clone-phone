@@ -30,7 +30,7 @@ app.post("/voice", (req, res) => {
   console.log("Twilio hit /voice webhook");
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
-  connect.stream({ url: `wss://${req.headers.host}/media` });
+connect.stream({ url: `wss://${req.headers.host}/media` });
   res.type("text/xml");
   res.send(twiml.toString());
 });
