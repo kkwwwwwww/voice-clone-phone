@@ -24,29 +24,32 @@ const RAW_CALL_MODE = process.env.CALL_MODE || "diagnostic";
 const CALL_MODE = VALID_CALL_MODES.has(RAW_CALL_MODE) ? RAW_CALL_MODE : "diagnostic";
 const TTS_TEST_PHRASE = "This is ElevenLabs audio over Twilio media.";
 const PORTFOLIO_QUEUE_GREETING_TEXT =
-  "Thanks for calling. I am checking the line and placing you in the queue now.";
+  "One moment. I am connecting your call now.";
 const PORTFOLIO_CAPTURE_PROMPT_TEXT =
-  "After the tone, tell me what this call is about.";
-const PORTFOLIO_PUTTING_THROUGH_TEXT = "Thanks. I am connecting you now.";
-const PORTFOLIO_FIRST_CLONE_REPLY = "Hey, I can hear you. What's going on?";
+  "After the tone, tell me what you need.";
+const PORTFOLIO_PUTTING_THROUGH_TEXT = "Okay. I am putting you through now.";
+const PORTFOLIO_FIRST_CLONE_REPLY = "Yeah? I am kind of in the middle of something.";
 const PORTFOLIO_FALLBACK_TRANSCRIPT = "The caller is speaking into the phone.";
-const PORTFOLIO_FALLBACK_REPLY = "Hey, I can hear you. What's going on?";
+const PORTFOLIO_FALLBACK_REPLY = "Yeah? I am kind of in the middle of something.";
 const PORTFOLIO_CAPTURE_BYTES = 18 * ULAW_SAMPLE_RATE;
 const PORTFOLIO_BUZZER_MS = 450;
 const PORTFOLIO_BUZZER_HZ = 880;
 const PORTFOLIO_JINGLE_MARK = "portfolio-jingle";
-const PORTFOLIO_CONVERSATION_MAX_TURNS = 5;
-const PORTFOLIO_TURN_MIN_BYTES = Math.floor(1.0 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_MAX_BYTES = Math.floor(7.0 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_NO_SPEECH_BYTES = Math.floor(10.0 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_SILENCE_MS = 900;
-const PORTFOLIO_SPEECH_RMS_THRESHOLD = 500;
+const PORTFOLIO_CONVERSATION_MAX_TURNS = 20;
+const PORTFOLIO_TURN_MIN_BYTES = Math.floor(0.45 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_MAX_BYTES = Math.floor(4.0 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_NO_SPEECH_BYTES = Math.floor(6.0 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_SILENCE_MS = 550;
+const PORTFOLIO_SPEECH_RMS_THRESHOLD = 1200;
+const PORTFOLIO_SILENCE_RMS_THRESHOLD = 850;
+const PORTFOLIO_BARGE_IN_RMS_THRESHOLD = 1500;
+const PORTFOLIO_BARGE_IN_MIN_CHUNKS = 5;
 const WS_OPEN_STATE = 1;
 const PORTFOLIO_LIMITS = {
   cloneAttempts: 1,
-  sttCalls: 6,
-  anthropicCalls: 5,
-  spokenReplies: 10,
+  sttCalls: 25,
+  anthropicCalls: 25,
+  spokenReplies: 50,
 };
 
 const sessions = new Map();
@@ -303,6 +306,23 @@ function sendAudioToTwilio(ws, streamSid, audioBuffer, markName, callSid) {
   }
 }
 
+function sendTwilioClear(ws, streamSid, callSid, reason = "barge-in") {
+  if (!streamSid) {
+    console.warn(`[${callLabel(callSid)}] TWILIO_CLEAR_SKIPPED reason=missing_streamSid clearReason=${reason}`);
+    return false;
+  }
+  if (ws.readyState !== WS_OPEN_STATE) {
+    console.warn(`[${callLabel(callSid)}] TWILIO_CLEAR_SKIPPED reason=websocket_not_open readyState=${ws.readyState} clearReason=${reason}`);
+    return false;
+  }
+  ws.send(JSON.stringify({
+    event: "clear",
+    streamSid,
+  }));
+  console.log(`[${callLabel(callSid)}] PORTFOLIO_BARGE_IN_CLEAR_SENT reason=${reason}`);
+  return true;
+}
+
 app.get("/", (req, res) => res.send("server running"));
 
 app.get("/health", (req, res) => {
@@ -418,6 +438,9 @@ wss.on("connection", (ws) => {
     portfolioConversationSpeechSeen: false,
     portfolioConversationSilentMs: 0,
     portfolioConversationVoiceId: null,
+    portfolioAiSpeaking: false,
+    portfolioAiSpeakingMark: null,
+    portfolioBargeInChunks: 0,
   };
 
   ws.on("message", async (message) => {
@@ -478,6 +501,32 @@ wss.on("connection", (ws) => {
         }
 
         if (CALL_MODE === "portfolio_demo") {
+          if (
+            session.portfolioAiSpeaking &&
+            !session.portfolioConversationActive &&
+            !session.portfolioConversationIsProcessing
+          ) {
+            const bargeRms = mulawRms(chunk);
+            if (bargeRms >= PORTFOLIO_BARGE_IN_RMS_THRESHOLD) {
+              session.portfolioBargeInChunks += 1;
+            } else {
+              session.portfolioBargeInChunks = Math.max(0, session.portfolioBargeInChunks - 1);
+            }
+
+            if (session.portfolioBargeInChunks >= PORTFOLIO_BARGE_IN_MIN_CHUNKS) {
+              const interruptedMark = session.portfolioAiSpeakingMark || "portfolio-speaking";
+              sendTwilioClear(ws, session.streamSid, session.callSid, interruptedMark);
+              session.portfolioAiSpeaking = false;
+              session.portfolioAiSpeakingMark = null;
+              session.portfolioBargeInChunks = 0;
+              startPortfolioConversationListening(session, "barge-in");
+              if (session.portfolioConversationActive && !session.portfolioConversationIsProcessing) {
+                handlePortfolioConversationMedia(session, ws, chunk);
+              }
+              return;
+            }
+          }
+
           if (session.portfolioConversationActive && !session.portfolioConversationIsProcessing) {
             handlePortfolioConversationMedia(session, ws, chunk);
             return;
@@ -533,6 +582,9 @@ wss.on("connection", (ws) => {
         }
 
         if (CALL_MODE === "portfolio_demo" && markName === "portfolio-reply-1") {
+          session.portfolioAiSpeaking = false;
+          session.portfolioAiSpeakingMark = null;
+          session.portfolioBargeInChunks = 0;
           console.log(`[${callLabel(session.callSid)}] PORTFOLIO_MAIN_REPLY_MARK_DONE`);
           startPortfolioConversationListening(session, "after-first-reply");
         }
@@ -541,6 +593,9 @@ wss.on("connection", (ws) => {
           CALL_MODE === "portfolio_demo" &&
           markName.startsWith("portfolio-conversation-reply-")
         ) {
+          session.portfolioAiSpeaking = false;
+          session.portfolioAiSpeakingMark = null;
+          session.portfolioBargeInChunks = 0;
           startPortfolioConversationListening(session, "after-conversation-reply");
         }
       }
@@ -608,19 +663,23 @@ async function getDoubleResponse(history, gatheredInfo, callSid) {
       throw new Error("ANTHROPIC_API_KEY is missing");
     }
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 80,
+      model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+      max_tokens: 36,
       system: `You are the other side of a live phone call.
 
-You are not a customer-service bot. You are not an automated menu. You are not a detective. Sound casual, human, slightly confused, and calm.
+You are a busy, distracted person who has just been interrupted. You are not a bot, not a menu, not customer service, and not a detective.
+
+Personality: casual, slightly impatient, believable, specific. You can sound busy. You can cut in with short phrases like "wait", "hold on", or "okay, go on", but do not be hostile.
 
 Reply to what the caller actually said. Use the conversation history. Keep the caller talking naturally.
 
-Keep replies very short: 4 to 12 words. One sentence is best. Ask at most one soft question.
+Keep replies extremely short: 3 to 9 words. One sentence only. Ask at most one soft question.
 
-Do not interrogate the caller. Do not ask the caller to justify the call. Do not repeatedly ask who this is. If the caller already said their name or reason, acknowledge it instead of asking again.
+Do not interrogate the caller. Do not repeatedly ask who this is. If the caller already said their name or reason, acknowledge it instead of asking again.
 
-Never mention AI, cloning, recording, voice samples, consent, waiver, systems, prompts, APIs, ElevenLabs, Claude, Twilio, or being a demo.
+Never discuss AI, cloning, captured audio, legal notices, systems, prompts, APIs, ElevenLabs, Claude, Twilio, or being a demo.
+
+Never give legal or consent notices during the call.
 
 Make every reply feel generated for this specific caller, not like a fixed script.
 
@@ -727,11 +786,11 @@ async function generateTts(voiceId, text, callSid) {
       },
       body: JSON.stringify({
         text,
-        model_id: "eleven_flash_v2_5",
+        model_id: process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5",
         voice_settings: {
-          stability: 0.3,
-          similarity_boost: 0.9,
-          style: 0.0,
+          stability: 0.45,
+          similarity_boost: 0.95,
+          style: 0.15,
           use_speaker_boost: false,
         },
       }),
@@ -1000,10 +1059,16 @@ function handlePortfolioConversationMedia(session, ws, chunk) {
   const chunkMs = (chunk.length / ULAW_SAMPLE_RATE) * 1000;
 
   if (rms >= PORTFOLIO_SPEECH_RMS_THRESHOLD) {
+    if (!session.portfolioConversationSpeechSeen) {
+      console.log(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_SPEECH_START rms=${Math.round(rms)}`);
+    }
     session.portfolioConversationSpeechSeen = true;
     session.portfolioConversationSilentMs = 0;
-  } else if (session.portfolioConversationSpeechSeen) {
+  } else if (session.portfolioConversationSpeechSeen && rms <= PORTFOLIO_SILENCE_RMS_THRESHOLD) {
     session.portfolioConversationSilentMs += chunkMs;
+  } else if (session.portfolioConversationSpeechSeen) {
+    // Ambiguous low-level room noise should not keep the AI waiting forever.
+    session.portfolioConversationSilentMs += chunkMs * 0.5;
   }
 
   if (
@@ -1095,26 +1160,27 @@ async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
 function getPortfolioFallbackReply(cycle) {
   const cycleText = String(cycle || "");
   const mainReplies = [
-    "Hey, I can hear you. What's going on?",
-    "Yeah, I'm here. What happened?",
-    "Hello? I can hear you now.",
-    "Hey. Sorry, the line just connected."
+    "Yeah? I am kind of in the middle of something.",
+    "Hello? Sorry, I am a little busy.",
+    "Yeah, go on. I am listening.",
+    "Wait, slow down a second."
   ];
 
   if (cycleText === "main") {
     return mainReplies[Math.floor(Math.random() * mainReplies.length)];
   }
 
-  const match = cycleText.match(/(\d+)/);
-  const index = match ? Math.max(0, Number(match[1]) - 1) : 0;
   const replies = [
-    "Yeah, that makes sense. Keep going.",
-    "Okay, I am listening.",
-    "Wait, say that part again.",
-    "Mm. What happened after that?",
-    "Yeah, I heard you."
+    "Mm. Keep going.",
+    "Wait, what do you mean?",
+    "Okay, that is weird.",
+    "I am listening. Go on.",
+    "Hold on, say that again.",
+    "Yeah, I get you.",
+    "Okay. Why does that matter?",
+    "Wait, who gave you this number?"
   ];
-  return replies[index % replies.length];
+  return replies[Math.floor(Math.random() * replies.length)];
 }
 
 function mulawRms(mulawBuffer) {
@@ -1281,6 +1347,15 @@ async function portfolioGenerateAndSend(session, ws, voiceId, text, markName, op
   const sent = sendAudioToTwilio(ws, session.streamSid, audio, markName, session.callSid);
   if (sent) {
     session.portfolioSpokenReplies += 1;
+    if (
+      CALL_MODE === "portfolio_demo" &&
+      markName &&
+      (markName === "portfolio-reply-1" || markName.startsWith("portfolio-conversation-reply-"))
+    ) {
+      session.portfolioAiSpeaking = true;
+      session.portfolioAiSpeakingMark = markName;
+      session.portfolioBargeInChunks = 0;
+    }
     console.log(
       `[${callLabel(session.callSid)}] PORTFOLIO_REPLY_SENT mark=${markName} spokenReplies=${session.portfolioSpokenReplies}`
     );
