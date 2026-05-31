@@ -24,36 +24,45 @@ const RAW_CALL_MODE = process.env.CALL_MODE || "diagnostic";
 const CALL_MODE = VALID_CALL_MODES.has(RAW_CALL_MODE) ? RAW_CALL_MODE : "diagnostic";
 const TTS_TEST_PHRASE = "This is ElevenLabs audio over Twilio media.";
 const PORTFOLIO_QUEUE_GREETING_TEXT =
-  "One moment. I am connecting your call now.";
+  "Please wait... while we connect you over.";
 const PORTFOLIO_CAPTURE_PROMPT_TEXT =
-  "After the tone, tell me what you need.";
-const PORTFOLIO_PUTTING_THROUGH_TEXT = "Okay. I am putting you through now.";
+  "After the tone, say anything you want to ask, give me any details, or explain why you are calling.";
+const PORTFOLIO_PUTTING_THROUGH_TEXT = "One second. Connecting you over now.";
 const PORTFOLIO_FIRST_CLONE_REPLY = "Yeah? I am kind of in the middle of something.";
 const PORTFOLIO_FALLBACK_TRANSCRIPT = "The caller is speaking into the phone.";
 const PORTFOLIO_FALLBACK_REPLY = "Yeah? I am kind of in the middle of something.";
-const PORTFOLIO_CAPTURE_BYTES = 18 * ULAW_SAMPLE_RATE;
+const PORTFOLIO_CAPTURE_SECONDS = Math.max(
+  8,
+  Number.parseFloat(process.env.PORTFOLIO_CAPTURE_SECONDS || "10")
+);
+const PORTFOLIO_CAPTURE_BYTES = Math.floor(PORTFOLIO_CAPTURE_SECONDS * ULAW_SAMPLE_RATE);
 const PORTFOLIO_BUZZER_MS = 450;
 const PORTFOLIO_BUZZER_HZ = 880;
 const PORTFOLIO_JINGLE_MARK = "portfolio-jingle";
-const PORTFOLIO_CONVERSATION_MAX_TURNS = 20;
-const PORTFOLIO_TURN_MIN_BYTES = Math.floor(0.45 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_MAX_BYTES = Math.floor(4.0 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_NO_SPEECH_BYTES = Math.floor(6.0 * ULAW_SAMPLE_RATE);
-const PORTFOLIO_TURN_SILENCE_MS = 550;
+const PORTFOLIO_TRANSFER_VIBRATION_MARK = "portfolio-transfer-vibration";
+const PORTFOLIO_CONVERSATION_MAX_TURNS = 30;
+const PORTFOLIO_TURN_MIN_BYTES = Math.floor(0.35 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_MAX_BYTES = Math.floor(3.2 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_NO_SPEECH_BYTES = Math.floor(5.0 * ULAW_SAMPLE_RATE);
+const PORTFOLIO_TURN_SILENCE_MS = 420;
 const PORTFOLIO_SPEECH_RMS_THRESHOLD = 1200;
 const PORTFOLIO_SILENCE_RMS_THRESHOLD = 850;
 const PORTFOLIO_BARGE_IN_RMS_THRESHOLD = 1500;
-const PORTFOLIO_BARGE_IN_MIN_CHUNKS = 5;
+const PORTFOLIO_BARGE_IN_MIN_CHUNKS = 4;
+const PORTFOLIO_THINKING_FILLER_DELAY_MS = Number.parseInt(
+  process.env.PORTFOLIO_THINKING_FILLER_DELAY_MS || "700",
+  10
+);
 const PORTFOLIO_MAIN_STT_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_MAIN_STT_TIMEOUT_MS || "8000", 10);
-const PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS || "3200", 10);
+const PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS || "2800", 10);
 const PORTFOLIO_ANTHROPIC_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_ANTHROPIC_TIMEOUT_MS || "3000", 10);
 const PORTFOLIO_TTS_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_TTS_TIMEOUT_MS || "5000", 10);
 const WS_OPEN_STATE = 1;
 const PORTFOLIO_LIMITS = {
   cloneAttempts: 1,
-  sttCalls: 25,
-  anthropicCalls: 25,
-  spokenReplies: 50,
+  sttCalls: 35,
+  anthropicCalls: 35,
+  spokenReplies: 80,
 };
 
 const sessions = new Map();
@@ -418,6 +427,9 @@ app.get("/health", (req, res) => {
     queueVoiceIdPreview: shortId(getQueueVoiceId()),
     hasCloneFallbackVoiceId: Boolean(getCloneFallbackVoiceId()),
     cloneFallbackVoiceIdPreview: shortId(getCloneFallbackVoiceId()),
+    portfolioCaptureSeconds: PORTFOLIO_CAPTURE_SECONDS,
+    portfolioTurnSilenceMs: PORTFOLIO_TURN_SILENCE_MS,
+    portfolioThinkingFillerDelayMs: PORTFOLIO_THINKING_FILLER_DELAY_MS,
   });
 });
 
@@ -521,6 +533,8 @@ wss.on("connection", (ws) => {
     portfolioAiSpeaking: false,
     portfolioAiSpeakingMark: null,
     portfolioBargeInChunks: 0,
+    portfolioPendingHangupMark: null,
+    portfolioThinkingFillerActive: false,
   };
 
   ws.on("message", async (message) => {
@@ -657,6 +671,15 @@ wss.on("connection", (ws) => {
           `[${callLabel(session.callSid)}] TWILIO_MARK_RECEIVED name=${markName} sequenceNumber=${data.sequenceNumber ?? "missing"}`
         );
 
+        if (
+          CALL_MODE === "portfolio_demo" &&
+          session.portfolioPendingHangupMark &&
+          markName === session.portfolioPendingHangupMark
+        ) {
+          closeCallAfterMark(session, ws, markName);
+          return;
+        }
+
         if (CALL_MODE === "portfolio_demo" && markName === "portfolio-buzzer") {
           startPortfolioCapture(session);
         }
@@ -744,18 +767,22 @@ async function getDoubleResponse(history, gatheredInfo, callSid) {
     }
     const response = await withTimeout(anthropic.messages.create({
       model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
-      max_tokens: 64,
+      max_tokens: 90,
       system: `You are the other side of a live phone call.
 
 You are a busy, distracted person who has just been interrupted. You are not a bot, not a menu, not customer service, and not a detective.
 
-Personality: casual, slightly impatient, believable, specific. You can sound busy. You can cut in with short phrases like "wait", "hold on", or "okay, go on", but do not be hostile.
+Personality: casual, specific, believable, a little impatient, and occasionally frustrated in a realistic way. You can interrupt with "wait", "hold on", "no, listen", or "okay, go on", but do not become cruel or theatrical.
 
-Reply to what the caller actually said. Use the conversation history. Keep the caller talking naturally.
+Reply to what the caller actually said. Use the conversation history. Answer direct questions instead of dodging them. If you do not know something, react like a real person: guess, push back, or ask for the missing detail.
 
-Keep replies short but not clipped: usually 8 to 18 words. One or two natural phone sentences. Ask at most one soft question.
+You are allowed to talk about yourself sometimes: what you are in the middle of, why you sound busy, what this call is interrupting, or why the caller's question is confusing. Do not only ask questions. Sometimes move the conversation forward yourself.
+
+Keep replies natural for a phone call: usually 8 to 24 words, one or two sentences. Occasionally use a slightly longer reply if the caller asks a real question.
 
 Do not interrogate the caller. Do not repeatedly ask who this is. If the caller already said their name or reason, acknowledge it instead of asking again.
+
+If the caller asks you to hang up, agree briefly and end the call.
 
 Never discuss AI, cloning, captured audio, legal notices, systems, prompts, APIs, ElevenLabs, Claude, Twilio, or being a demo.
 
@@ -868,10 +895,10 @@ async function generateTts(voiceId, text, callSid) {
         text,
         model_id: process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5",
         voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.98,
-          style: 0.05,
-          use_speaker_boost: false,
+          stability: Number.parseFloat(process.env.ELEVENLABS_STABILITY || "0.52"),
+          similarity_boost: Number.parseFloat(process.env.ELEVENLABS_SIMILARITY_BOOST || "1.0"),
+          style: Number.parseFloat(process.env.ELEVENLABS_STYLE || "0.02"),
+          use_speaker_boost: process.env.ELEVENLABS_USE_SPEAKER_BOOST === "true",
         },
       }),
     }, PORTFOLIO_TTS_TIMEOUT_MS, "ElevenLabs TTS", callSid);
@@ -961,6 +988,82 @@ function sendPortfolioBuzzer(session, ws) {
   const sent = sendAudioToTwilio(ws, session.streamSid, tone, "portfolio-buzzer", session.callSid);
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_BUZZER_SENT sent=${sent} bytes=${tone.length}`);
   return sent;
+}
+
+function sendPortfolioTransferVibration(session, ws) {
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TRANSFER_VIBRATION_START`);
+  const vibration = generateMulawMelody([
+    { hz: 132.0, ms: 180 },
+    { hz: 0, ms: 70 },
+    { hz: 132.0, ms: 180 },
+    { hz: 0, ms: 70 },
+    { hz: 176.0, ms: 220 },
+  ], ULAW_SAMPLE_RATE);
+  const sent = sendAudioToTwilio(ws, session.streamSid, vibration, PORTFOLIO_TRANSFER_VIBRATION_MARK, session.callSid);
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TRANSFER_VIBRATION_SENT sent=${sent} bytes=${vibration.length}`);
+  return sent;
+}
+
+function getPortfolioThinkingFiller(turn) {
+  const fillers = [
+    "Mm.",
+    "Okay.",
+    "Right.",
+    "Hold on.",
+    "Yeah, one sec.",
+  ];
+  const index = Math.abs(Number(turn) || 0) % fillers.length;
+  return fillers[index];
+}
+
+function shouldCallerRequestHangup(transcript) {
+  const text = String(transcript || "").toLowerCase();
+  if (!text.trim()) return false;
+  if (/\b(don't|do not|dont|not)\s+(hang up|end the call|disconnect)\b/.test(text)) return false;
+  return /\b(hang up|end the call|disconnect|you can hang up|can you hang up|please hang up|bye bye)\b/.test(text);
+}
+
+function closeCallAfterMark(session, ws, markName) {
+  if (session.isClosed) return;
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_HANGUP_REQUEST_FULFILLED mark=${markName}`);
+  session.portfolioConversationActive = false;
+  session.portfolioConversationIsProcessing = false;
+  session.portfolioAiSpeaking = false;
+  session.portfolioAiSpeakingMark = null;
+  setTimeout(() => {
+    if (ws.readyState === WS_OPEN_STATE) {
+      ws.close(1000, "caller_requested_hangup");
+    }
+  }, 150);
+}
+
+async function sendPortfolioThinkingFiller(session, ws, turn) {
+  if (!isCallOpen(session, ws) || session.portfolioThinkingFillerActive) return false;
+  session.portfolioThinkingFillerActive = true;
+  try {
+    const cloneStillAvailable =
+      session.portfolioCreatedVoiceId &&
+      !session.voiceCleanupStarted &&
+      session.portfolioConversationVoiceId === session.portfolioCreatedVoiceId;
+    const voiceId = cloneStillAvailable
+      ? session.portfolioConversationVoiceId
+      : getCloneFallbackVoiceId();
+    const fallbackVoiceId = getCloneFallbackVoiceId();
+    const filler = getPortfolioThinkingFiller(turn);
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_THINKING_FILLER_START turn=${turn} text="${filler}"`
+    );
+    return await portfolioGenerateAndSendWithFallback(
+      session,
+      ws,
+      voiceId,
+      fallbackVoiceId,
+      filler,
+      `portfolio-thinking-filler-${turn}`
+    );
+  } finally {
+    session.portfolioThinkingFillerActive = false;
+  }
 }
 
 function generateMulawTone(frequencyHz, durationMs, sampleRate) {
@@ -1065,6 +1168,8 @@ async function runPortfolioMainReply(session, ws) {
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_SAMPLE_TOO_SHORT bytes=${sampleBuffer.length}`);
   }
 
+  sendPortfolioTransferVibration(session, ws);
+
   await portfolioGenerateAndSend(
     session,
     ws,
@@ -1079,11 +1184,23 @@ async function runPortfolioMainReply(session, ws) {
   const transcript = await transcriptPromise;
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TRANSCRIPT_FOR_DEMO transcript="${truncateForLog(transcript, 300)}"`);
 
+  const callerAskedToHangUp = shouldCallerRequestHangup(transcript);
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_CLAUDE_START`);
-  const firstReply = await portfolioGetReply(session, transcript, "main");
+  const firstReply = await portfolioGetReply(
+    session,
+    callerAskedToHangUp
+      ? `${transcript}\nThe caller asked to end the call. Reply briefly and say goodbye.`
+      : transcript,
+    "main"
+  );
   console.log(
     `[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_TEXT text="${truncateForLog(firstReply, 300)}"`
   );
+
+  if (callerAskedToHangUp) {
+    session.portfolioPendingHangupMark = "portfolio-reply-1";
+    console.log(`[${callLabel(session.callSid)}] PORTFOLIO_HANGUP_REQUEST_DETECTED cycle=main`);
+  }
 
   const cloneVoiceId = await clonePromise;
   const fallbackVoiceId = getCloneFallbackVoiceId();
@@ -1217,57 +1334,90 @@ async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
     return;
   }
 
-  const transcript = await portfolioTranscribe(session, sampleBuffer, `conversation-${turn}`);
-  if (!isCallOpen(session, ws)) {
-    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_stt`);
-    return;
-  }
+  let finalReplyStarted = false;
+  const fillerTimer = setTimeout(() => {
+    if (!finalReplyStarted && isCallOpen(session, ws)) {
+      sendPortfolioThinkingFiller(session, ws, turn).catch((err) =>
+        logApiError("portfolio_thinking_filler", session.callSid, err, "warn")
+      );
+    }
+  }, PORTFOLIO_THINKING_FILLER_DELAY_MS);
 
-  console.log(
-    `[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TRANSCRIPT turn=${turn} transcript="${truncateForLog(transcript, 300)}"`
-  );
+  let transcript;
+  try {
+    transcript = await portfolioTranscribe(session, sampleBuffer, `conversation-${turn}`);
+    if (!isCallOpen(session, ws)) {
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_stt`);
+      return;
+    }
 
-  const reply = await portfolioGetReply(session, transcript, `conversation-${turn}`);
-  if (!isCallOpen(session, ws)) {
-    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_claude`);
-    return;
-  }
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TRANSCRIPT turn=${turn} transcript="${truncateForLog(transcript, 300)}"`
+    );
 
-  const cloneStillAvailable =
-    session.portfolioCreatedVoiceId &&
-    !session.voiceCleanupStarted &&
-    session.portfolioConversationVoiceId === session.portfolioCreatedVoiceId;
-  const voiceId = cloneStillAvailable
-    ? session.portfolioConversationVoiceId
-    : getCloneFallbackVoiceId();
-  const fallbackVoiceId = getCloneFallbackVoiceId();
+    const callerAskedToHangUp = shouldCallerRequestHangup(transcript);
+    const reply = await portfolioGetReply(
+      session,
+      callerAskedToHangUp
+        ? `${transcript}\nThe caller asked to end the call. Reply briefly and say goodbye.`
+        : transcript,
+      `conversation-${turn}`
+    );
+    if (!isCallOpen(session, ws)) {
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_claude`);
+      return;
+    }
 
-  console.log(
-    `[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_REPLY turn=${turn} voiceId=${shortId(voiceId)} reply="${truncateForLog(reply, 300)}"`
-  );
+    const cloneStillAvailable =
+      session.portfolioCreatedVoiceId &&
+      !session.voiceCleanupStarted &&
+      session.portfolioConversationVoiceId === session.portfolioCreatedVoiceId;
+    const voiceId = cloneStillAvailable
+      ? session.portfolioConversationVoiceId
+      : getCloneFallbackVoiceId();
+    const fallbackVoiceId = getCloneFallbackVoiceId();
+    const markName = callerAskedToHangUp
+      ? `portfolio-hangup-reply-${turn}`
+      : `portfolio-conversation-reply-${turn}`;
 
-  const sent = await portfolioGenerateAndSendWithFallback(
-    session,
-    ws,
-    voiceId,
-    fallbackVoiceId,
-    reply,
-    `portfolio-conversation-reply-${turn}`
-  );
+    if (callerAskedToHangUp) {
+      session.portfolioPendingHangupMark = markName;
+      console.log(`[${callLabel(session.callSid)}] PORTFOLIO_HANGUP_REQUEST_DETECTED turn=${turn}`);
+    }
 
-  if (!sent && !session.isClosed && turn < PORTFOLIO_CONVERSATION_MAX_TURNS) {
-    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_REPLY_NOT_SENT turn=${turn} action=resume_listening`);
-    startPortfolioConversationListening(session, "reply-not-sent");
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_REPLY turn=${turn} voiceId=${shortId(voiceId)} reply="${truncateForLog(reply, 300)}"`
+    );
+
+    finalReplyStarted = true;
+    clearTimeout(fillerTimer);
+
+    const sent = await portfolioGenerateAndSendWithFallback(
+      session,
+      ws,
+      voiceId,
+      fallbackVoiceId,
+      reply,
+      markName
+    );
+
+    if (!sent && !session.isClosed && turn < PORTFOLIO_CONVERSATION_MAX_TURNS && !callerAskedToHangUp) {
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_REPLY_NOT_SENT turn=${turn} action=resume_listening`);
+      startPortfolioConversationListening(session, "reply-not-sent");
+    }
+  } finally {
+    finalReplyStarted = true;
+    clearTimeout(fillerTimer);
   }
 }
 
 function getPortfolioFallbackReply(cycle) {
   const cycleText = String(cycle || "");
   const mainReplies = [
-    "Yeah, I hear you—slow down a bit and tell me what happened.",
-    "Sorry, I am in the middle of something, but I am listening.",
-    "Okay, start from the beginning—what exactly are you trying to sort out?",
-    "Hold on, I caught some of that. Say the important part again."
+    "Yeah, I hear you. I am halfway through something, but go on.",
+    "Okay, that is a lot. Start with the bit that matters most.",
+    "Hold on, I caught some of that. I am listening now.",
+    "Right, okay. I was not expecting this call, but keep going."
   ];
 
   if (cycleText === "main") {
@@ -1275,14 +1425,16 @@ function getPortfolioFallbackReply(cycle) {
   }
 
   const replies = [
-    "Mm, keep going—I am trying to follow this.",
-    "Wait, say that part again, I missed it.",
-    "Okay, that is weird, but keep talking.",
-    "I am listening. What happened right before that?",
-    "Hold on, slow down for one second.",
+    "Mm. I am still here—keep going.",
+    "Wait, I missed one bit. Say that again.",
+    "Okay, that is weird, but I am following.",
+    "No, listen, that part actually matters.",
+    "I am trying to finish something, but go on.",
     "Yeah, I get the shape of it now.",
-    "Okay, why does that bit matter?",
-    "Wait, who actually gave you this number?"
+    "Hold on. That does not quite add up.",
+    "Okay, I can answer that, but be specific.",
+    "Right. I would not have called me for that.",
+    "Fine, keep talking. I am listening."
   ];
   return replies[Math.floor(Math.random() * replies.length)];
 }
