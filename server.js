@@ -44,6 +44,10 @@ const PORTFOLIO_SPEECH_RMS_THRESHOLD = 1200;
 const PORTFOLIO_SILENCE_RMS_THRESHOLD = 850;
 const PORTFOLIO_BARGE_IN_RMS_THRESHOLD = 1500;
 const PORTFOLIO_BARGE_IN_MIN_CHUNKS = 5;
+const PORTFOLIO_MAIN_STT_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_MAIN_STT_TIMEOUT_MS || "8000", 10);
+const PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS || "3200", 10);
+const PORTFOLIO_ANTHROPIC_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_ANTHROPIC_TIMEOUT_MS || "3000", 10);
+const PORTFOLIO_TTS_TIMEOUT_MS = Number.parseInt(process.env.PORTFOLIO_TTS_TIMEOUT_MS || "5000", 10);
 const WS_OPEN_STATE = 1;
 const PORTFOLIO_LIMITS = {
   cloneAttempts: 1,
@@ -178,6 +182,74 @@ function parseInteger(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function isCallOpen(session, ws) {
+  return Boolean(session && !session.isClosed && ws && ws.readyState === WS_OPEN_STATE && session.streamSid);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs, stage, callSid) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      console.warn(`[${callLabel(callSid)}] API_TIMEOUT stage=${stage} ms=${timeoutMs}`);
+      throw new Error(`${stage} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function withTimeout(promise, timeoutMs, stage, callSid) {
+  let timeoutId = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      console.warn(`[${callLabel(callSid)}] API_TIMEOUT stage=${stage} ms=${timeoutMs}`);
+      reject(new Error(`${stage} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function looksLikeBadSttTranscript(text) {
+  const normalized = String(text || "").toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) return true;
+
+  const words = normalized.split(" ").filter(Boolean);
+  if (words.length === 0) return true;
+
+  const wobCount = words.filter((word) => word === "wob" || word === "wah" || word === "blah").length;
+  if (wobCount >= 5 && wobCount / words.length > 0.5) return true;
+
+  const uniqueWords = new Set(words);
+  if (words.length >= 10 && uniqueWords.size <= 3) return true;
+
+  return false;
+}
+
+function sanitizePhoneReply(text) {
+  const cleaned = String(text || "")
+    .replace(/\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) return "Hang on, say that again—I missed part of it.";
+
+  const withoutMeta = cleaned
+    .replace(/\b(AI|bot|Claude|ElevenLabs|Twilio|API|clone|voice cloning|demo)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return withoutMeta || "Hang on, say that again—I missed part of it.";
+}
+
 function logBoot(PORT) {
   console.log("APP_STARTED service=voice-clone-phone");
   console.log(`NODE_ENV=${process.env.NODE_ENV || "unset"}`);
@@ -235,6 +307,16 @@ function logMediaStats(session, reason = "interval") {
 }
 
 function cleanupSession(session, reason, extra = {}) {
+  if (session.cleanupLogged) {
+    session.isClosed = true;
+    return;
+  }
+  session.cleanupLogged = true;
+  session.isClosed = true;
+  session.portfolioConversationActive = false;
+  session.portfolioConversationChunks = [];
+  session.portfolioConversationBytes = 0;
+
   if (session.processingTimer) {
     clearInterval(session.processingTimer);
     session.processingTimer = null;
@@ -251,8 +333,6 @@ function cleanupSession(session, reason, extra = {}) {
     clearTimeout(session.portfolioCaptureStartFallbackTimer);
     session.portfolioCaptureStartFallbackTimer = null;
   }
-  session.isClosed = true;
-
   const closeInfo = extra.code ? ` code=${extra.code} reason="${truncateForLog(extra.reason || "")}"` : "";
   console.log(
     `[${callLabel(session.callSid)}] CALL_${reason.toUpperCase()} streamSid=${session.streamSid || "unknown"} packets=${session.packetCount} bytes=${session.allBytes} approxSeconds=${(session.allBytes / ULAW_SAMPLE_RATE).toFixed(2)}${closeInfo}`
@@ -662,9 +742,9 @@ async function getDoubleResponse(history, gatheredInfo, callSid) {
     if (!anthropic) {
       throw new Error("ANTHROPIC_API_KEY is missing");
     }
-    const response = await anthropic.messages.create({
+    const response = await withTimeout(anthropic.messages.create({
       model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
-      max_tokens: 36,
+      max_tokens: 64,
       system: `You are the other side of a live phone call.
 
 You are a busy, distracted person who has just been interrupted. You are not a bot, not a menu, not customer service, and not a detective.
@@ -673,7 +753,7 @@ Personality: casual, slightly impatient, believable, specific. You can sound bus
 
 Reply to what the caller actually said. Use the conversation history. Keep the caller talking naturally.
 
-Keep replies extremely short: 3 to 9 words. One sentence only. Ask at most one soft question.
+Keep replies short but not clipped: usually 8 to 18 words. One or two natural phone sentences. Ask at most one soft question.
 
 Do not interrogate the caller. Do not repeatedly ask who this is. If the caller already said their name or reason, acknowledge it instead of asking again.
 
@@ -686,9 +766,9 @@ Make every reply feel generated for this specific caller, not like a fixed scrip
 ${infoContext}`,
 
       messages: history,
-    });
+    }), PORTFOLIO_ANTHROPIC_TIMEOUT_MS, "Anthropic response generation", callSid);
 
-    return response.content[0].text.trim();
+    return sanitizePhoneReply(response.content[0].text.trim());
   } catch (err) {
     logApiError("Anthropic response generation", callSid, err);
     throw err;
@@ -734,7 +814,7 @@ async function refreshClone(session) {
   }
 }
 
-async function transcribeAudio(mulawBuffer, callSid) {
+async function transcribeAudio(mulawBuffer, callSid, timeoutMs = PORTFOLIO_MAIN_STT_TIMEOUT_MS) {
   const wav = mulawBufferToPcmWav(mulawBuffer);
   const form = new FormData();
   form.append("file", new Blob([wav], { type: "audio/wav" }), "utterance.wav");
@@ -742,11 +822,11 @@ async function transcribeAudio(mulawBuffer, callSid) {
 
   startTimer("ElevenLabs STT", callSid);
   try {
-    const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    const response = await fetchWithTimeout("https://api.elevenlabs.io/v1/speech-to-text", {
       method: "POST",
       headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
       body: form,
-    });
+    }, timeoutMs, "ElevenLabs STT", callSid);
 
     if (!response.ok) {
       const bodyPreview = await readResponsePreview(response);
@@ -778,7 +858,7 @@ async function generateTts(voiceId, text, callSid) {
       `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}` +
       "?output_format=ulaw_8000&optimize_streaming_latency=3";
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "xi-api-key": process.env.ELEVENLABS_API_KEY,
@@ -788,13 +868,13 @@ async function generateTts(voiceId, text, callSid) {
         text,
         model_id: process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5",
         voice_settings: {
-          stability: 0.45,
-          similarity_boost: 0.95,
-          style: 0.15,
+          stability: 0.5,
+          similarity_boost: 0.98,
+          style: 0.05,
           use_speaker_boost: false,
         },
       }),
-    });
+    }, PORTFOLIO_TTS_TIMEOUT_MS, "ElevenLabs TTS", callSid);
 
     if (!response.ok) {
       const bodyPreview = await readResponsePreview(response);
@@ -1061,6 +1141,9 @@ function handlePortfolioConversationMedia(session, ws, chunk) {
   if (rms >= PORTFOLIO_SPEECH_RMS_THRESHOLD) {
     if (!session.portfolioConversationSpeechSeen) {
       console.log(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_SPEECH_START rms=${Math.round(rms)}`);
+      // Drop pre-speech silence/noise so batch STT receives only the caller's actual follow-up.
+      session.portfolioConversationChunks = [chunk];
+      session.portfolioConversationBytes = chunk.length;
     }
     session.portfolioConversationSpeechSeen = true;
     session.portfolioConversationSilentMs = 0;
@@ -1129,13 +1212,34 @@ function finishPortfolioConversationTurn(session, ws, reason) {
 async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_START turn=${turn}`);
 
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_before_stt`);
+    return;
+  }
+
   const transcript = await portfolioTranscribe(session, sampleBuffer, `conversation-${turn}`);
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_stt`);
+    return;
+  }
+
   console.log(
     `[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TRANSCRIPT turn=${turn} transcript="${truncateForLog(transcript, 300)}"`
   );
 
   const reply = await portfolioGetReply(session, transcript, `conversation-${turn}`);
-  const voiceId = session.portfolioConversationVoiceId || getCloneFallbackVoiceId();
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_TURN_ABORTED turn=${turn} reason=call_not_open_after_claude`);
+    return;
+  }
+
+  const cloneStillAvailable =
+    session.portfolioCreatedVoiceId &&
+    !session.voiceCleanupStarted &&
+    session.portfolioConversationVoiceId === session.portfolioCreatedVoiceId;
+  const voiceId = cloneStillAvailable
+    ? session.portfolioConversationVoiceId
+    : getCloneFallbackVoiceId();
   const fallbackVoiceId = getCloneFallbackVoiceId();
 
   console.log(
@@ -1151,7 +1255,7 @@ async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
     `portfolio-conversation-reply-${turn}`
   );
 
-  if (!sent && turn < PORTFOLIO_CONVERSATION_MAX_TURNS) {
+  if (!sent && !session.isClosed && turn < PORTFOLIO_CONVERSATION_MAX_TURNS) {
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CONVERSATION_REPLY_NOT_SENT turn=${turn} action=resume_listening`);
     startPortfolioConversationListening(session, "reply-not-sent");
   }
@@ -1160,10 +1264,10 @@ async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
 function getPortfolioFallbackReply(cycle) {
   const cycleText = String(cycle || "");
   const mainReplies = [
-    "Yeah? I am kind of in the middle of something.",
-    "Hello? Sorry, I am a little busy.",
-    "Yeah, go on. I am listening.",
-    "Wait, slow down a second."
+    "Yeah, I hear you—slow down a bit and tell me what happened.",
+    "Sorry, I am in the middle of something, but I am listening.",
+    "Okay, start from the beginning—what exactly are you trying to sort out?",
+    "Hold on, I caught some of that. Say the important part again."
   ];
 
   if (cycleText === "main") {
@@ -1171,14 +1275,14 @@ function getPortfolioFallbackReply(cycle) {
   }
 
   const replies = [
-    "Mm. Keep going.",
-    "Wait, what do you mean?",
-    "Okay, that is weird.",
-    "I am listening. Go on.",
-    "Hold on, say that again.",
-    "Yeah, I get you.",
-    "Okay. Why does that matter?",
-    "Wait, who gave you this number?"
+    "Mm, keep going—I am trying to follow this.",
+    "Wait, say that part again, I missed it.",
+    "Okay, that is weird, but keep talking.",
+    "I am listening. What happened right before that?",
+    "Hold on, slow down for one second.",
+    "Yeah, I get the shape of it now.",
+    "Okay, why does that bit matter?",
+    "Wait, who actually gave you this number?"
   ];
   return replies[Math.floor(Math.random() * replies.length)];
 }
@@ -1201,10 +1305,17 @@ async function portfolioTranscribe(session, mulawBuffer, cycle) {
 
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_STT_START cycle=${cycle} bytes=${mulawBuffer.length}`);
   try {
-    const transcript = await transcribeAudio(mulawBuffer, session.callSid);
+    const timeoutMs = String(cycle).startsWith("conversation-")
+      ? PORTFOLIO_CONVERSATION_STT_TIMEOUT_MS
+      : PORTFOLIO_MAIN_STT_TIMEOUT_MS;
+    const transcript = await transcribeAudio(mulawBuffer, session.callSid, timeoutMs);
     if (!transcript || !transcript.trim()) {
       console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_STT_FALLBACK cycle=${cycle} reason=empty`);
       return PORTFOLIO_FALLBACK_TRANSCRIPT;
+    }
+    if (looksLikeBadSttTranscript(transcript)) {
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_STT_FALLBACK cycle=${cycle} reason=bad_transcript transcript="${truncateForLog(transcript, 200)}"`);
+      return "The caller made a short unclear sound and is waiting for a response.";
     }
     console.log(
       `[${callLabel(session.callSid)}] PORTFOLIO_STT_DONE cycle=${cycle} transcript="${truncateForLog(transcript, 500)}"`
@@ -1301,6 +1412,11 @@ async function createPortfolioClone(session, mulawBuffer) {
 }
 
 async function portfolioGenerateAndSendWithFallback(session, ws, primaryVoiceId, fallbackVoiceId, text, markName) {
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_SKIPPED mark=${markName} reason=call_not_open_before_tts`);
+    return false;
+  }
+
   const primaryIsFallback = !primaryVoiceId || primaryVoiceId === fallbackVoiceId;
   if (!primaryIsFallback) {
     const sentWithPrimary = await portfolioGenerateAndSend(session, ws, primaryVoiceId, text, markName, {
@@ -1320,6 +1436,10 @@ async function portfolioGenerateAndSendWithFallback(session, ws, primaryVoiceId,
 }
 
 async function portfolioGenerateAndSend(session, ws, voiceId, text, markName, options = {}) {
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_SKIPPED mark=${markName} reason=call_not_open`);
+    return false;
+  }
   if (!voiceId) {
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_SKIPPED reason=missing_voice_id mark=${markName}`);
     return false;
@@ -1343,6 +1463,11 @@ async function portfolioGenerateAndSend(session, ws, voiceId, text, markName, op
     return false;
   }
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_DONE mark=${markName} bytes=${audio.length}`);
+
+  if (!isCallOpen(session, ws)) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_NOT_SENT mark=${markName} reason=call_closed_after_tts`);
+    return false;
+  }
 
   const sent = sendAudioToTwilio(ws, session.streamSid, audio, markName, session.callSid);
   if (sent) {
