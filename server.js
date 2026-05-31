@@ -26,16 +26,16 @@ const TTS_TEST_PHRASE = "This is ElevenLabs audio over Twilio media.";
 const PORTFOLIO_QUEUE_GREETING_TEXT =
   "Thanks for calling. I am checking the line and placing you in the queue now.";
 const PORTFOLIO_CAPTURE_PROMPT_TEXT =
-  "After the tone, tell me what this call is about. I will use your voice for this consented call demo.";
+  "After the tone, tell me what this call is about.";
 const PORTFOLIO_PUTTING_THROUGH_TEXT = "Thanks. I am connecting you now.";
-const PORTFOLIO_FIRST_CLONE_REPLY = "Hello? Sorry, who's this?";
+const PORTFOLIO_FIRST_CLONE_REPLY = "Hey, I can hear you. What's going on?";
 const PORTFOLIO_FALLBACK_TRANSCRIPT = "The caller is speaking into the phone.";
-const PORTFOLIO_FALLBACK_REPLY = "Hello? Sorry, who's this?";
+const PORTFOLIO_FALLBACK_REPLY = "Hey, I can hear you. What's going on?";
 const PORTFOLIO_CAPTURE_BYTES = 18 * ULAW_SAMPLE_RATE;
 const PORTFOLIO_BUZZER_MS = 450;
 const PORTFOLIO_BUZZER_HZ = 880;
 const PORTFOLIO_JINGLE_MARK = "portfolio-jingle";
-const PORTFOLIO_CONVERSATION_MAX_TURNS = 3;
+const PORTFOLIO_CONVERSATION_MAX_TURNS = 5;
 const PORTFOLIO_TURN_MIN_BYTES = Math.floor(1.0 * ULAW_SAMPLE_RATE);
 const PORTFOLIO_TURN_MAX_BYTES = Math.floor(7.0 * ULAW_SAMPLE_RATE);
 const PORTFOLIO_TURN_NO_SPEECH_BYTES = Math.floor(10.0 * ULAW_SAMPLE_RATE);
@@ -610,15 +610,19 @@ async function getDoubleResponse(history, gatheredInfo, callSid) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-5",
       max_tokens: 80,
-      system: `You are a casual person who has just been connected to a strange phone call.
+      system: `You are the other side of a live phone call.
 
-Sound natural, slightly confused, and calm. Do not sound like customer service, a chatbot, a detective, or an automated system.
+You are not a customer-service bot. You are not an automated menu. You are not a detective. Sound casual, human, slightly confused, and calm.
 
-Keep replies very short: usually under 12 words. One sentence is best. Ask at most one question.
+Reply to what the caller actually said. Use the conversation history. Keep the caller talking naturally.
 
-Do not interrogate the caller. Avoid "why did you call" unless it genuinely fits. Prefer ordinary phone-call lines like "Hello?", "Sorry, who's this?", "Wait, what number did you call?", or "Yeah, I'm here."
+Keep replies very short: 4 to 12 words. One sentence is best. Ask at most one soft question.
 
-Never mention AI, cloning, voice samples, systems, prompts, or being a demo. Never explain yourself. Just talk.
+Do not interrogate the caller. Do not ask the caller to justify the call. Do not repeatedly ask who this is. If the caller already said their name or reason, acknowledge it instead of asking again.
+
+Never mention AI, cloning, recording, voice samples, consent, waiver, systems, prompts, APIs, ElevenLabs, Claude, Twilio, or being a demo.
+
+Make every reply feel generated for this specific caller, not like a fixed script.
 
 ${infoContext}`,
 
@@ -907,7 +911,7 @@ async function runPortfolioQuickAck(session, ws) {
     session,
     ws,
     getQueueVoiceId(),
-    "Keep going. I need a little more of your voice.",
+    "Keep going. I am checking the line.",
     "portfolio-quick-ack"
   );
 }
@@ -936,6 +940,12 @@ async function runPortfolioMainReply(session, ws) {
   const transcript = await transcriptPromise;
   console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TRANSCRIPT_FOR_DEMO transcript="${truncateForLog(transcript, 300)}"`);
 
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_CLAUDE_START`);
+  const firstReply = await portfolioGetReply(session, transcript, "main");
+  console.log(
+    `[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_TEXT text="${truncateForLog(firstReply, 300)}"`
+  );
+
   const cloneVoiceId = await clonePromise;
   const fallbackVoiceId = getCloneFallbackVoiceId();
   const voiceId = cloneVoiceId || fallbackVoiceId;
@@ -951,7 +961,7 @@ async function runPortfolioMainReply(session, ws) {
     ws,
     voiceId,
     fallbackVoiceId,
-    PORTFOLIO_FIRST_CLONE_REPLY,
+    firstReply,
     "portfolio-reply-1"
   );
 }
@@ -1084,15 +1094,25 @@ async function runPortfolioConversationTurn(session, ws, sampleBuffer, turn) {
 
 function getPortfolioFallbackReply(cycle) {
   const cycleText = String(cycle || "");
-  if (cycleText === "main") return PORTFOLIO_FALLBACK_REPLY;
+  const mainReplies = [
+    "Hey, I can hear you. What's going on?",
+    "Yeah, I'm here. What happened?",
+    "Hello? I can hear you now.",
+    "Hey. Sorry, the line just connected."
+  ];
+
+  if (cycleText === "main") {
+    return mainReplies[Math.floor(Math.random() * mainReplies.length)];
+  }
 
   const match = cycleText.match(/(\d+)/);
   const index = match ? Math.max(0, Number(match[1]) - 1) : 0;
   const replies = [
-    "Yeah, I can hear you. What's up?",
-    "Wait, where did you get this number?",
-    "Okay. Keep talking, I'm listening.",
-    "Sorry, say that again?"
+    "Yeah, that makes sense. Keep going.",
+    "Okay, I am listening.",
+    "Wait, say that part again.",
+    "Mm. What happened after that?",
+    "Yeah, I heard you."
   ];
   return replies[index % replies.length];
 }
@@ -1136,11 +1156,13 @@ async function portfolioGetReply(session, transcript, cycle) {
 
   if (!hasEnv("ANTHROPIC_API_KEY")) {
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=missing_api_key`);
+    if (String(cycle) === "main") console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_FALLBACK reason=missing_api_key`);
     return fallbackReply;
   }
 
   if (!takePortfolioLimit(session, "portfolioAnthropicCalls", PORTFOLIO_LIMITS.anthropicCalls, "anthropicCalls")) {
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=limit`);
+    if (String(cycle) === "main") console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_FALLBACK reason=limit`);
     return fallbackReply;
   }
 
@@ -1155,11 +1177,15 @@ async function portfolioGetReply(session, transcript, cycle) {
     console.log(
       `[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_DONE cycle=${cycle} reply="${truncateForLog(reply, 500)}"`
     );
+    if (String(cycle) === "main") {
+      console.log(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_CLAUDE_DONE`);
+    }
     session.history.push({ role: "assistant", content: reply });
     return reply;
   } catch (err) {
     logApiError("Portfolio Anthropic", session.callSid, err, "warn");
     console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=error`);
+    if (String(cycle) === "main") console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_FIRST_REPLY_FALLBACK reason=error`);
     session.history.push({ role: "assistant", content: fallbackReply });
     return fallbackReply;
   }
