@@ -2,17 +2,14 @@ require("dotenv").config({ quiet: true });
 
 const express = require("express");
 const http = require("http");
-const { Readable } = require("stream");
 const { WebSocketServer } = require("ws");
 const twilio = require("twilio");
 const Anthropic = require("@anthropic-ai/sdk");
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
 
-const elevenlabsClientPromise = import("@elevenlabs/elevenlabs-js").then(
-  ({ ElevenLabsClient }) =>
-    new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY })
-);
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -22,10 +19,28 @@ const PROCESS_INTERVAL_MS = 3000;
 const MEDIA_STATS_INTERVAL_MS = 5000;
 const ULAW_SAMPLE_RATE = 8000;
 const API_ERROR_PREVIEW_CHARS = 500;
-const VALID_CALL_MODES = new Set(["diagnostic", "tts_test", "full"]);
+const VALID_CALL_MODES = new Set(["diagnostic", "tts_test", "full", "portfolio_demo"]);
 const RAW_CALL_MODE = process.env.CALL_MODE || "diagnostic";
 const CALL_MODE = VALID_CALL_MODES.has(RAW_CALL_MODE) ? RAW_CALL_MODE : "diagnostic";
 const TTS_TEST_PHRASE = "This is ElevenLabs audio over Twilio media.";
+const PORTFOLIO_QUEUE_GREETING_TEXT =
+  "Thank you for calling. You are currently being held in a priority queue.";
+const PORTFOLIO_CAPTURE_PROMPT_TEXT =
+  "Before I connect you, please explain the purpose of your call after the tone. This consented demo will process and clone your voice for this call.";
+const PORTFOLIO_PUTTING_THROUGH_TEXT = "Thank you. I am putting you through now.";
+const PORTFOLIO_FIRST_CLONE_REPLY = "Hey, who's this? Why did you call?";
+const PORTFOLIO_FALLBACK_TRANSCRIPT = "The caller is speaking into the phone.";
+const PORTFOLIO_FALLBACK_REPLY = "Hey, who's this? Why did you call?";
+const PORTFOLIO_CAPTURE_BYTES = 18 * ULAW_SAMPLE_RATE;
+const PORTFOLIO_BUZZER_MS = 450;
+const PORTFOLIO_BUZZER_HZ = 880;
+const WS_OPEN_STATE = 1;
+const PORTFOLIO_LIMITS = {
+  cloneAttempts: 1,
+  sttCalls: 2,
+  anthropicCalls: 2,
+  spokenReplies: 5,
+};
 
 const sessions = new Map();
 const activeTimers = new Map();
@@ -35,7 +50,24 @@ function hasEnv(name) {
 }
 
 function getTestVoiceId() {
-  return process.env.ELEVENLABS_TEST_VOICE_ID || process.env.ELEVENLABS_FALLBACK_VOICE_ID || "";
+  return (
+    process.env.ELEVENLABS_TEST_VOICE_ID ||
+    process.env.ELEVENLABS_FALLBACK_VOICE_ID ||
+    process.env.ELEVENLABS_VOICE_ID ||
+    process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+    process.env.FALLBACK_VOICE_ID ||
+    process.env.VOICE_ID ||
+    ""
+  );
+}
+
+function getPortfolioMissingEnv() {
+  const missing = [];
+  if (!hasEnv("ELEVENLABS_API_KEY")) missing.push("ELEVENLABS_API_KEY");
+  if (!getTestVoiceId()) {
+    missing.push("ELEVENLABS_TEST_VOICE_ID or ELEVENLABS_FALLBACK_VOICE_ID or ELEVENLABS_VOICE_ID");
+  }
+  return missing;
 }
 
 function shortId(value) {
@@ -98,6 +130,17 @@ function logApiError(stage, callSid, err, level = "error") {
   logApiHttpError(stage, callSid, status, bodyPreview, level);
 }
 
+function takePortfolioLimit(session, key, max, label) {
+  if (session[key] >= max) {
+    console.warn(
+      `[${callLabel(session.callSid)}] PORTFOLIO_LIMIT_BLOCKED type=${label} count=${session[key]} max=${max}`
+    );
+    return false;
+  }
+  session[key] += 1;
+  return true;
+}
+
 function parseInteger(value) {
   if (value === undefined || value === null || value === "") return null;
   const parsed = Number.parseInt(value, 10);
@@ -113,7 +156,7 @@ function logBoot(PORT) {
   console.log(`CALL_MODE=${CALL_MODE}`);
   console.log(`ANTHROPIC_API_KEY=${hasEnv("ANTHROPIC_API_KEY") ? "present" : "missing"}`);
   console.log(`ELEVENLABS_API_KEY=${hasEnv("ELEVENLABS_API_KEY") ? "present" : "missing"}`);
-  console.log(`ELEVENLABS_TEST_OR_FALLBACK_VOICE_ID=${getTestVoiceId() ? "present" : "missing"}`);
+  console.log(`ELEVENLABS_FIXED_VOICE_ID=${getTestVoiceId() ? "present" : "missing"}`);
   console.log(`PORT=${PORT}`);
 }
 
@@ -168,6 +211,15 @@ function cleanupSession(session, reason, extra = {}) {
     clearInterval(session.statsTimer);
     session.statsTimer = null;
   }
+  if (session.portfolioQuickAckTimer) {
+    clearTimeout(session.portfolioQuickAckTimer);
+    session.portfolioQuickAckTimer = null;
+  }
+  if (session.portfolioCaptureStartFallbackTimer) {
+    clearTimeout(session.portfolioCaptureStartFallbackTimer);
+    session.portfolioCaptureStartFallbackTimer = null;
+  }
+  session.isClosed = true;
 
   const closeInfo = extra.code ? ` code=${extra.code} reason="${truncateForLog(extra.reason || "")}"` : "";
   console.log(
@@ -178,9 +230,11 @@ function cleanupSession(session, reason, extra = {}) {
     sessions.delete(session.streamSid);
   }
 
-  if (CALL_MODE === "full" && session.voiceId && !session.voiceCleanupStarted) {
-    const voiceId = session.voiceId;
+  const cleanupVoiceId = CALL_MODE === "portfolio_demo" ? session.portfolioCreatedVoiceId : session.voiceId;
+  if ((CALL_MODE === "full" || CALL_MODE === "portfolio_demo") && cleanupVoiceId && !session.voiceCleanupStarted) {
+    const voiceId = cleanupVoiceId;
     session.voiceId = null;
+    session.portfolioCreatedVoiceId = null;
     session.voiceCleanupStarted = true;
     deleteVoice(voiceId, session.callSid);
   }
@@ -193,7 +247,7 @@ function sendAudioToTwilio(ws, streamSid, audioBuffer, markName, callSid) {
       console.warn(`[${callLabel(callSid)}] TWILIO_MEDIA_SEND_SKIPPED reason=missing_streamSid`);
       return false;
     }
-    if (ws.readyState !== ws.OPEN) {
+    if (ws.readyState !== WS_OPEN_STATE) {
       console.warn(`[${callLabel(callSid)}] TWILIO_MEDIA_SEND_SKIPPED reason=websocket_not_open readyState=${ws.readyState}`);
       return false;
     }
@@ -229,6 +283,8 @@ app.get("/health", (req, res) => {
     callMode: CALL_MODE,
     hasAnthropicKey: hasEnv("ANTHROPIC_API_KEY"),
     hasElevenLabsKey: hasEnv("ELEVENLABS_API_KEY"),
+    hasFixedVoiceId: Boolean(getTestVoiceId()),
+    fixedVoiceIdPreview: shortId(getTestVoiceId()),
   });
 });
 
@@ -250,11 +306,18 @@ app.post("/stream-status", (req, res) => {
   res.sendStatus(204);
 });
 
-app.post("/voice", (req, res) => {
+function handleVoiceWebhook(req, res) {
   const host = req.headers.host;
+  const body = req.body || {};
+  const query = req.query || {};
+  const callSid = body.CallSid || query.CallSid || "missing";
+  const from = body.From || query.From || "missing";
+  const to = body.To || query.To || "missing";
+
   console.log(
-    `TWILIO_VOICE_HIT timestamp=${new Date().toISOString()} host=${host || "missing"} callMode=${CALL_MODE} CallSid=${req.body.CallSid || "missing"} From=${req.body.From || "missing"} To=${req.body.To || "missing"}`
+    `TWILIO_VOICE_HIT timestamp=${new Date().toISOString()} host=${host || "missing"} callMode=${CALL_MODE} method=${req.method} CallSid=${callSid} From=${from} To=${to}`
   );
+
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
   connect.stream({
@@ -262,9 +325,13 @@ app.post("/voice", (req, res) => {
     statusCallback: `https://${host}/stream-status`,
     statusCallbackMethod: "POST",
   });
+
   res.type("text/xml");
   res.send(twiml.toString());
-});
+}
+
+app.get("/voice", handleVoiceWebhook);
+app.post("/voice", handleVoiceWebhook);
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
@@ -294,6 +361,22 @@ wss.on("connection", (ws) => {
     timestampJumps: 0,
     ttsTestStarted: false,
     voiceCleanupStarted: false,
+    isClosed: false,
+    portfolioEnvReady: false,
+    portfolioOpeningStarted: false,
+    portfolioQuickAckStarted: false,
+    portfolioQuickAckTimer: null,
+    portfolioCaptureStartFallbackTimer: null,
+    portfolioCaptureStarted: false,
+    portfolioCaptureChunks: [],
+    portfolioCaptureBytes: 0,
+    portfolioMainStarted: false,
+    portfolioCreatedVoiceId: null,
+    portfolioCloneAttempts: 0,
+    portfolioSttCalls: 0,
+    portfolioAnthropicCalls: 0,
+    portfolioTtsCalls: 0,
+    portfolioSpokenReplies: 0,
   };
 
   ws.on("message", async (message) => {
@@ -322,6 +405,20 @@ wss.on("connection", (ws) => {
           session.ttsTestStarted = true;
           runTtsTest(session, ws).catch((err) => logApiError("tts_test", session.callSid, err));
         }
+
+        if (CALL_MODE === "portfolio_demo" && !session.portfolioOpeningStarted) {
+          const missing = getPortfolioMissingEnv();
+          session.portfolioEnvReady = missing.length === 0;
+          if (!session.portfolioEnvReady) {
+            console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_MISSING_ENV names="${missing.join(", ")}"`);
+          } else {
+            if (!hasEnv("ANTHROPIC_API_KEY")) {
+              console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_OPTIONAL_ENV_MISSING names="ANTHROPIC_API_KEY" action="using fixed/fallback replies"`);
+            }
+            session.portfolioOpeningStarted = true;
+            runPortfolioOpening(session, ws).catch((err) => logApiError("portfolio_opening", session.callSid, err));
+          }
+        }
       }
 
       if (data.event === "media") {
@@ -337,6 +434,26 @@ wss.on("connection", (ws) => {
           console.log(
             `[${callLabel(session.callSid)}] FIRST_MEDIA_PACKET bytes=${chunk.length} twilioTimestamp=${data.media.timestamp ?? "missing"} sequenceNumber=${data.sequenceNumber ?? "missing"}`
           );
+        }
+
+        if (CALL_MODE === "portfolio_demo") {
+          if (session.portfolioCaptureStarted && !session.portfolioMainStarted) {
+            session.portfolioCaptureChunks.push(chunk);
+            session.portfolioCaptureBytes += chunk.length;
+
+            if (
+              session.portfolioEnvReady &&
+              session.portfolioCaptureBytes >= PORTFOLIO_CAPTURE_BYTES
+            ) {
+              session.portfolioMainStarted = true;
+              console.log(
+                `[${callLabel(session.callSid)}] PORTFOLIO_SAMPLE_COLLECTION_DONE bytes=${session.portfolioCaptureBytes} approxSeconds=${(session.portfolioCaptureBytes / ULAW_SAMPLE_RATE).toFixed(2)}`
+              );
+              runPortfolioMainReply(session, ws).catch((err) => logApiError("portfolio_main_reply", session.callSid, err));
+            }
+          }
+
+          return;
         }
 
         if (CALL_MODE !== "full") return;
@@ -363,6 +480,14 @@ wss.on("connection", (ws) => {
         console.log(
           `[${callLabel(session.callSid)}] TWILIO_MARK_RECEIVED name=${data.mark?.name || "missing"} sequenceNumber=${data.sequenceNumber ?? "missing"}`
         );
+
+        if (CALL_MODE === "portfolio_demo" && data.mark?.name === "portfolio-buzzer") {
+          startPortfolioCapture(session);
+        }
+
+        if (CALL_MODE === "portfolio_demo" && data.mark?.name === "portfolio-reply-1") {
+          console.log(`[${callLabel(session.callSid)}] PORTFOLIO_MAIN_REPLY_MARK_DONE`);
+        }
       }
 
       if (data.event === "stop") {
@@ -424,6 +549,9 @@ async function getDoubleResponse(history, gatheredInfo, callSid) {
 
   startTimer("Anthropic response generation", callSid);
   try {
+    if (!anthropic) {
+      throw new Error("ANTHROPIC_API_KEY is missing");
+    }
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-5",
       max_tokens: 80,
@@ -522,19 +650,48 @@ async function generateTts(voiceId, text, callSid) {
   console.log(`[${callLabel(callSid)}] ELEVENLABS_TTS_START voiceId=${shortId(voiceId)} chars=${text.length}`);
   startTimer("ElevenLabs TTS", callSid);
   try {
-    const elevenlabs = await elevenlabsClientPromise;
-    const response = await elevenlabs.textToSpeech.convert(voiceId, {
-      modelId: "eleven_flash_v2_5",
-      outputFormat: "ulaw_8000",
-      text,
-      voiceSettings: {
-        stability: 0.3,
-        similarityBoost: 0.9,
-        style: 0.0,
-        useSpeakerBoost: false,
+    if (!hasEnv("ELEVENLABS_API_KEY")) {
+      throw new Error("Missing ELEVENLABS_API_KEY");
+    }
+    if (!voiceId) {
+      throw new Error("Missing ElevenLabs voice id");
+    }
+
+    const url =
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}` +
+      "?output_format=ulaw_8000&optimize_streaming_latency=3";
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
       },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_flash_v2_5",
+        voice_settings: {
+          stability: 0.3,
+          similarity_boost: 0.9,
+          style: 0.0,
+          use_speaker_boost: false,
+        },
+      }),
     });
-    const audio = await streamToBuffer(Readable.from(response));
+
+    if (!response.ok) {
+      const bodyPreview = await readResponsePreview(response);
+      logApiHttpError("ElevenLabs TTS", callSid, response.status, bodyPreview);
+      throw new Error(`TTS failed status=${response.status}`);
+    }
+
+    const audio = Buffer.from(await response.arrayBuffer());
+    const header = audio.slice(0, 4).toString("ascii");
+    if (header === "RIFF" || header.startsWith("ID3")) {
+      console.warn(
+        `[${callLabel(callSid)}] ELEVENLABS_TTS_FORMAT_WARNING header="${truncateForLog(header)}" expected=raw_ulaw_8000`
+      );
+    }
     console.log(`[${callLabel(callSid)}] ELEVENLABS_TTS_DONE bytes=${audio.length}`);
     return audio;
   } catch (err) {
@@ -558,6 +715,311 @@ async function runTtsTest(session, ws) {
 
   const audio = await generateTts(voiceId, TTS_TEST_PHRASE, session.callSid);
   sendAudioToTwilio(ws, session.streamSid, audio, "tts-test-1", session.callSid);
+}
+
+function startPortfolioCapture(session) {
+  if (session.isClosed || session.portfolioCaptureStarted || session.portfolioMainStarted) return;
+
+  if (session.portfolioCaptureStartFallbackTimer) {
+    clearTimeout(session.portfolioCaptureStartFallbackTimer);
+    session.portfolioCaptureStartFallbackTimer = null;
+  }
+
+  session.portfolioCaptureStarted = true;
+  session.portfolioCaptureChunks = [];
+  session.portfolioCaptureBytes = 0;
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_SAMPLE_COLLECTION_START targetBytes=${PORTFOLIO_CAPTURE_BYTES} targetSeconds=${(PORTFOLIO_CAPTURE_BYTES / ULAW_SAMPLE_RATE).toFixed(2)}`);
+}
+
+function sendPortfolioBuzzer(session, ws) {
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_BUZZER_START durationMs=${PORTFOLIO_BUZZER_MS} hz=${PORTFOLIO_BUZZER_HZ}`);
+  const tone = generateMulawTone(PORTFOLIO_BUZZER_HZ, PORTFOLIO_BUZZER_MS, ULAW_SAMPLE_RATE);
+  const sent = sendAudioToTwilio(ws, session.streamSid, tone, "portfolio-buzzer", session.callSid);
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_BUZZER_SENT sent=${sent} bytes=${tone.length}`);
+  return sent;
+}
+
+function generateMulawTone(frequencyHz, durationMs, sampleRate) {
+  const sampleCount = Math.max(1, Math.floor((durationMs / 1000) * sampleRate));
+  const out = Buffer.alloc(sampleCount);
+  const amplitude = 9000;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const fadeSamples = Math.floor(sampleRate * 0.02);
+    let envelope = 1;
+    if (i < fadeSamples) envelope = i / fadeSamples;
+    if (i > sampleCount - fadeSamples) envelope = Math.max(0, (sampleCount - i) / fadeSamples);
+
+    const sample = Math.sin((2 * Math.PI * frequencyHz * i) / sampleRate) * amplitude * envelope;
+    out[i] = linearToMuLaw(sample);
+  }
+
+  return out;
+}
+
+function linearToMuLaw(sample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+
+  let pcm = Math.max(-32768, Math.min(32767, Math.round(sample)));
+  let sign = 0;
+  if (pcm < 0) {
+    pcm = -pcm;
+    sign = 0x80;
+  }
+
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+
+  let exponent = 7;
+  for (let mask = 0x4000; exponent > 0 && (pcm & mask) === 0; exponent--, mask >>= 1) {
+    // Scan for exponent.
+  }
+
+  const mantissa = (pcm >> (exponent + 3)) & 0x0f;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+
+async function runPortfolioOpening(session, ws) {
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_QUEUE_GREETING_START`);
+
+  const greetingSent = await portfolioGenerateAndSend(
+    session,
+    ws,
+    getTestVoiceId(),
+    PORTFOLIO_QUEUE_GREETING_TEXT,
+    "portfolio-queue-greeting"
+  );
+
+  const promptSent = await portfolioGenerateAndSend(
+    session,
+    ws,
+    getTestVoiceId(),
+    PORTFOLIO_CAPTURE_PROMPT_TEXT,
+    "portfolio-capture-prompt"
+  );
+
+  const buzzerSent = sendPortfolioBuzzer(session, ws);
+  console.log(
+    `[${callLabel(session.callSid)}] PORTFOLIO_QUEUE_GREETING_DONE greetingSent=${greetingSent} promptSent=${promptSent} buzzerSent=${buzzerSent}`
+  );
+
+  if (buzzerSent && !session.portfolioCaptureStartFallbackTimer) {
+    session.portfolioCaptureStartFallbackTimer = setTimeout(() => {
+      session.portfolioCaptureStartFallbackTimer = null;
+      if (!session.portfolioCaptureStarted && !session.isClosed) {
+        console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CAPTURE_START_FALLBACK reason=buzzer_mark_not_received`);
+        startPortfolioCapture(session);
+      }
+    }, 15000);
+  }
+}
+
+async function runPortfolioQuickAck(session, ws) {
+  if (session.isClosed || session.portfolioQuickAckStarted) return;
+  session.portfolioQuickAckStarted = true;
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_QUICK_ACK_START`);
+  await portfolioGenerateAndSend(
+    session,
+    ws,
+    getTestVoiceId(),
+    "Keep going. I need a little more of your voice.",
+    "portfolio-quick-ack"
+  );
+}
+
+async function runPortfolioMainReply(session, ws) {
+  const sampleBuffer = Buffer.concat(session.portfolioCaptureChunks || []);
+  console.log(
+    `[${callLabel(session.callSid)}] PORTFOLIO_SAMPLE_READY bytes=${sampleBuffer.length} approxSeconds=${(sampleBuffer.length / ULAW_SAMPLE_RATE).toFixed(2)}`
+  );
+
+  if (sampleBuffer.length < ULAW_SAMPLE_RATE * 3) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_SAMPLE_TOO_SHORT bytes=${sampleBuffer.length}`);
+  }
+
+  await portfolioGenerateAndSend(
+    session,
+    ws,
+    getTestVoiceId(),
+    PORTFOLIO_PUTTING_THROUGH_TEXT,
+    "portfolio-putting-through"
+  );
+
+  const clonePromise = createPortfolioClone(session, sampleBuffer);
+  const transcriptPromise = portfolioTranscribe(session, sampleBuffer, "main");
+
+  const transcript = await transcriptPromise;
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TRANSCRIPT_FOR_DEMO transcript="${truncateForLog(transcript, 300)}"`);
+
+  const cloneVoiceId = await clonePromise;
+  const voiceId = cloneVoiceId || getTestVoiceId();
+  if (!cloneVoiceId) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_FALLBACK voiceId=${shortId(voiceId)}`);
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_FALLBACK reason=no_clone voiceId=${shortId(voiceId)}`);
+  }
+
+  await portfolioGenerateAndSendWithFallback(
+    session,
+    ws,
+    voiceId,
+    getTestVoiceId(),
+    PORTFOLIO_FIRST_CLONE_REPLY,
+    "portfolio-reply-1"
+  );
+}
+
+async function portfolioTranscribe(session, mulawBuffer, cycle) {
+  if (!takePortfolioLimit(session, "portfolioSttCalls", PORTFOLIO_LIMITS.sttCalls, "sttCalls")) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_STT_FALLBACK cycle=${cycle} reason=limit`);
+    return PORTFOLIO_FALLBACK_TRANSCRIPT;
+  }
+
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_STT_START cycle=${cycle} bytes=${mulawBuffer.length}`);
+  try {
+    const transcript = await transcribeAudio(mulawBuffer, session.callSid);
+    if (!transcript || !transcript.trim()) {
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_STT_FALLBACK cycle=${cycle} reason=empty`);
+      return PORTFOLIO_FALLBACK_TRANSCRIPT;
+    }
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_STT_DONE cycle=${cycle} transcript="${truncateForLog(transcript, 500)}"`
+    );
+    return transcript;
+  } catch (err) {
+    logApiError("Portfolio STT", session.callSid, err, "warn");
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_STT_FALLBACK cycle=${cycle} reason=error`);
+    return PORTFOLIO_FALLBACK_TRANSCRIPT;
+  }
+}
+
+async function portfolioGetReply(session, transcript, cycle) {
+  if (!hasEnv("ANTHROPIC_API_KEY")) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=missing_api_key`);
+    return PORTFOLIO_FALLBACK_REPLY;
+  }
+
+  if (!takePortfolioLimit(session, "portfolioAnthropicCalls", PORTFOLIO_LIMITS.anthropicCalls, "anthropicCalls")) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=limit`);
+    return PORTFOLIO_FALLBACK_REPLY;
+  }
+
+  const userText = transcript && transcript.trim()
+    ? transcript.trim()
+    : "The caller spoke, but the transcription was empty.";
+  session.history.push({ role: "user", content: userText });
+
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_START cycle=${cycle}`);
+  try {
+    const reply = await getDoubleResponse(session.history, session.gatheredInfo, session.callSid);
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_DONE cycle=${cycle} reply="${truncateForLog(reply, 500)}"`
+    );
+    session.history.push({ role: "assistant", content: reply });
+    return reply;
+  } catch (err) {
+    logApiError("Portfolio Anthropic", session.callSid, err, "warn");
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_ANTHROPIC_FALLBACK cycle=${cycle} reason=error`);
+    session.history.push({ role: "assistant", content: PORTFOLIO_FALLBACK_REPLY });
+    return PORTFOLIO_FALLBACK_REPLY;
+  }
+}
+
+async function createPortfolioClone(session, mulawBuffer) {
+  if (!takePortfolioLimit(session, "portfolioCloneAttempts", PORTFOLIO_LIMITS.cloneAttempts, "cloneAttempts")) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_FALLBACK reason=limit`);
+    return null;
+  }
+
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_START bytes=${mulawBuffer.length}`);
+  startTimer("Portfolio clone creation", session.callSid);
+
+  const wav = mulawBufferToPcmWav(mulawBuffer);
+  const form = new FormData();
+  form.append("name", `portfolio-${session.callSid.slice(-8)}`);
+  form.append("remove_background_noise", "true");
+  form.append("files", new Blob([wav], { type: "audio/wav" }), "sample.wav");
+
+  try {
+    const response = await fetch("https://api.elevenlabs.io/v1/voices/add", {
+      method: "POST",
+      headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
+      body: form,
+    });
+
+    if (!response.ok) {
+      const bodyPreview = await readResponsePreview(response);
+      logApiHttpError("Portfolio clone creation", session.callSid, response.status, bodyPreview, "warn");
+      console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_FALLBACK reason=http_status status=${response.status}`);
+      return null;
+    }
+
+    const json = await response.json();
+    session.voiceId = json.voice_id;
+    session.portfolioCreatedVoiceId = json.voice_id;
+    console.log(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_DONE voiceId=${shortId(json.voice_id)}`);
+    return json.voice_id;
+  } catch (err) {
+    logApiError("Portfolio clone creation", session.callSid, err, "warn");
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_CLONE_FALLBACK reason=error`);
+    return null;
+  } finally {
+    endTimer("Portfolio clone creation", session.callSid);
+  }
+}
+
+async function portfolioGenerateAndSendWithFallback(session, ws, primaryVoiceId, fallbackVoiceId, text, markName) {
+  const primaryIsFallback = !primaryVoiceId || primaryVoiceId === fallbackVoiceId;
+  if (!primaryIsFallback) {
+    const sentWithPrimary = await portfolioGenerateAndSend(session, ws, primaryVoiceId, text, markName, {
+      throwOnTtsFailure: true,
+    }).catch((err) => {
+      logApiError("Portfolio cloned voice TTS", session.callSid, err, "warn");
+      console.warn(
+        `[${callLabel(session.callSid)}] PORTFOLIO_TTS_FALLBACK reason=cloned_tts_failed fallbackVoiceId=${shortId(fallbackVoiceId)}`
+      );
+      return false;
+    });
+
+    if (sentWithPrimary) return true;
+  }
+
+  return portfolioGenerateAndSend(session, ws, fallbackVoiceId, text, markName);
+}
+
+async function portfolioGenerateAndSend(session, ws, voiceId, text, markName, options = {}) {
+  if (!voiceId) {
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_SKIPPED reason=missing_voice_id mark=${markName}`);
+    return false;
+  }
+  if (session.portfolioSpokenReplies >= PORTFOLIO_LIMITS.spokenReplies) {
+    console.warn(
+      `[${callLabel(session.callSid)}] PORTFOLIO_LIMIT_BLOCKED type=spokenReplies count=${session.portfolioSpokenReplies} max=${PORTFOLIO_LIMITS.spokenReplies}`
+    );
+    return false;
+  }
+
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_START mark=${markName} voiceId=${shortId(voiceId)}`);
+  session.portfolioTtsCalls += 1;
+  let audio;
+  try {
+    audio = await generateTts(voiceId, text, session.callSid);
+  } catch (err) {
+    logApiError("Portfolio TTS", session.callSid, err, "warn");
+    if (options.throwOnTtsFailure) throw err;
+    console.warn(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_FALLBACK mark=${markName} reason=tts_error_no_retry`);
+    return false;
+  }
+  console.log(`[${callLabel(session.callSid)}] PORTFOLIO_TTS_DONE mark=${markName} bytes=${audio.length}`);
+
+  const sent = sendAudioToTwilio(ws, session.streamSid, audio, markName, session.callSid);
+  if (sent) {
+    session.portfolioSpokenReplies += 1;
+    console.log(
+      `[${callLabel(session.callSid)}] PORTFOLIO_REPLY_SENT mark=${markName} spokenReplies=${session.portfolioSpokenReplies}`
+    );
+  }
+  return sent;
 }
 
 async function deleteVoice(voiceId, callSid) {
@@ -625,14 +1087,6 @@ function muLawDecode(muLawByte) {
   return sample;
 }
 
-function streamToBuffer(readableStream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    readableStream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-    readableStream.on("end", () => resolve(Buffer.concat(chunks)));
-    readableStream.on("error", reject);
-  });
-}
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
